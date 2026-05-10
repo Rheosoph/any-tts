@@ -24,6 +24,8 @@ const DEFAULT_T_SHIFT: f64 = 0.1;
 const DEFAULT_LAYER_PENALTY: f32 = 5.0;
 const DEFAULT_POSITION_TEMPERATURE: f32 = 5.0;
 const DEFAULT_CLASS_TEMPERATURE: f32 = 0.0;
+const DEFAULT_AUDIO_CHUNK_DURATION: f32 = 15.0;
+const DEFAULT_AUDIO_CHUNK_THRESHOLD: f32 = 30.0;
 
 struct OmniVoiceGenerationConfig {
     num_step: usize,
@@ -33,6 +35,8 @@ struct OmniVoiceGenerationConfig {
     position_temperature: f32,
     class_temperature: f32,
     denoise: bool,
+    audio_chunk_duration: f32,
+    audio_chunk_threshold: f32,
 }
 
 impl OmniVoiceGenerationConfig {
@@ -50,6 +54,14 @@ impl OmniVoiceGenerationConfig {
                 .temperature
                 .unwrap_or(DEFAULT_CLASS_TEMPERATURE as f64) as f32,
             denoise: true,
+            audio_chunk_duration: env_override_f32(
+                "OMNIVOICE_AUDIO_CHUNK_DURATION",
+                DEFAULT_AUDIO_CHUNK_DURATION,
+            ),
+            audio_chunk_threshold: env_override_f32(
+                "OMNIVOICE_AUDIO_CHUNK_THRESHOLD",
+                DEFAULT_AUDIO_CHUNK_THRESHOLD,
+            ),
         }
     }
 }
@@ -59,6 +71,12 @@ struct InferenceInputs {
     audio_mask: Vec<u8>,
     seq_len: usize,
     target_len: usize,
+}
+
+#[derive(Clone)]
+struct GeneratedAudioTokens {
+    tokens: Vec<u32>,
+    len: usize,
 }
 
 struct OmniVoiceBackbone {
@@ -316,150 +334,15 @@ impl TtsModel for OmniVoiceModel {
         let target_len = request
             .max_tokens
             .unwrap_or_else(|| estimate_target_tokens(&request.text, self.frame_rate));
-        let inputs = self.prepare_inference_inputs(
+        let token_chunks = self.generate_token_chunks(
             &request.text,
             target_len,
             normalized_language.as_deref(),
             normalized_instruct.as_deref(),
-            gen_config.denoise,
+            &gen_config,
         )?;
-
-        let cond_len = inputs.seq_len;
-        let target_len = inputs.target_len;
-        let mask_id = self.config.audio_mask_id;
-        let total_masked = self.config.num_audio_codebook * target_len;
-        let schedule = build_schedule(total_masked, gen_config.num_step, gen_config.t_shift);
-        let use_causal_mask = std::env::var_os("OMNIVOICE_CAUSAL_MASK").is_some();
-        let cond_attention_mask = if use_causal_mask {
-            Some(self.causal_attention_mask(cond_len)?)
-        } else {
-            None
-        };
-        let uncond_attention_mask = if use_causal_mask {
-            Some(self.causal_attention_mask(target_len)?)
-        } else {
-            None
-        };
-
-        let mut cond_input_ids = inputs.input_ids.clone();
-        let mut uncond_input_ids = vec![mask_id; self.config.num_audio_codebook * target_len];
-
-        let cond_audio_mask_u32_values: Vec<u32> =
-            inputs.audio_mask.iter().copied().map(u32::from).collect();
-        let cond_audio_mask_f32_values: Vec<f32> =
-            inputs.audio_mask.iter().copied().map(f32::from).collect();
-        let cond_audio_mask_u32 =
-            Tensor::new(cond_audio_mask_u32_values.as_slice(), &self.compute_device)?
-                .reshape((1, cond_len))?;
-        let cond_audio_mask_f32 =
-            Tensor::new(cond_audio_mask_f32_values.as_slice(), &self.compute_device)?
-                .reshape((1, cond_len))?;
-        let uncond_audio_mask_u32 =
-            Tensor::ones((1, target_len), DType::U32, &self.compute_device)?;
-        let uncond_audio_mask_f32 =
-            Tensor::ones((1, target_len), DType::F32, &self.compute_device)?;
-        let mut tokens = vec![mask_id; self.config.num_audio_codebook * target_len];
-        let mut rng = SimpleRng::new(omnivoice_seed());
-        let layer_penalties: Vec<f32> = (0..self.config.num_audio_codebook)
-            .map(|layer| layer as f32 * gen_config.layer_penalty_factor)
-            .collect();
-        let mut step_trace = Vec::new();
-
-        for (step_index, step_k) in schedule.iter().copied().enumerate() {
-            if step_k == 0 {
-                continue;
-            }
-
-            let cond_input_ids_tensor = Tensor::new(
-                cond_input_ids.as_slice(),
-                &self.compute_device,
-            )?
-            .reshape((1, self.config.num_audio_codebook, cond_len))?;
-            let cond_logits = self
-                .backbone
-                .lock()
-                .map_err(|_| {
-                    TtsError::RuntimeError("OmniVoice model mutex was poisoned".to_string())
-                })?
-                .forward(
-                    &cond_input_ids_tensor,
-                    &cond_audio_mask_u32,
-                    &cond_audio_mask_f32,
-                    cond_attention_mask.as_ref(),
-                )?
-                .to_dtype(DType::F32)?
-                .i((0..1, .., cond_len - target_len..cond_len, ..))?;
-            let uncond_input_ids_tensor = Tensor::new(
-                uncond_input_ids.as_slice(),
-                &self.compute_device,
-            )?
-            .reshape((1, self.config.num_audio_codebook, target_len))?;
-            let u_logits = self
-                .backbone
-                .lock()
-                .map_err(|_| {
-                    TtsError::RuntimeError("OmniVoice model mutex was poisoned".to_string())
-                })?
-                .forward(
-                    &uncond_input_ids_tensor,
-                    &uncond_audio_mask_u32,
-                    &uncond_audio_mask_f32,
-                    uncond_attention_mask.as_ref(),
-                )?
-                .to_dtype(DType::F32)?;
-            let (pred_tokens, scores) =
-                self.predict_tokens_with_scoring(&cond_logits, &u_logits, &gen_config, &mut rng)?;
-            maybe_dump_debug_first_step(&cond_logits, &u_logits, &pred_tokens, &scores)?;
-
-            let pred_tokens_flat = pred_tokens.flatten_all()?.to_vec1::<u32>()?;
-            let mut scores_flat = scores.flatten_all()?.to_vec1::<f32>()?;
-            for (layer_scores, penalty) in scores_flat
-                .chunks_exact_mut(target_len)
-                .zip(layer_penalties.iter().copied())
-            {
-                for score in layer_scores {
-                    *score -= penalty;
-                }
-            }
-
-            let chosen_positions = select_positions(
-                &scores_flat,
-                &tokens,
-                mask_id,
-                step_k,
-                gen_config.position_temperature,
-                &mut rng,
-            );
-            maybe_record_step_trace(
-                &mut step_trace,
-                step_index,
-                step_k,
-                &chosen_positions,
-                &pred_tokens_flat,
-                target_len,
-            );
-            for flat_index in chosen_positions {
-                tokens[flat_index] = pred_tokens_flat[flat_index];
-                let layer = flat_index / target_len;
-                let pos = flat_index % target_len;
-                cond_input_ids[index_2d(layer, cond_len - target_len + pos, cond_len)] =
-                    pred_tokens_flat[flat_index];
-                uncond_input_ids[index_2d(layer, pos, target_len)] = pred_tokens_flat[flat_index];
-            }
-        }
-
-        maybe_dump_step_trace(&step_trace)?;
-        maybe_dump_debug_tokens(&tokens, self.config.num_audio_codebook, target_len)?;
-
-        let token_tensor = Tensor::new(tokens.as_slice(), &self.audio_device)?.reshape((
-            1,
-            self.config.num_audio_codebook,
-            target_len,
-        ))?;
-        let waveform = self.audio_tokenizer.decode(&token_tensor)?;
-        let waveform = waveform.squeeze(1)?.squeeze(0)?.to_device(&Device::Cpu)?;
-        let mut samples = waveform.to_vec1::<f32>()?;
-        post_process_audio(&mut samples);
+        let mut samples = self.decode_token_chunks(&token_chunks)?;
+        post_process_audio(&mut samples, self.sample_rate());
 
         Ok(AudioSamples::new(samples, self.sample_rate()))
     }
@@ -554,6 +437,254 @@ impl OmniVoiceModel {
         Some(mapped.to_string())
     }
 
+    fn generate_token_chunks(
+        &self,
+        text: &str,
+        target_len: usize,
+        language: Option<&str>,
+        instruct: Option<&str>,
+        gen_config: &OmniVoiceGenerationConfig,
+    ) -> Result<Vec<GeneratedAudioTokens>, TtsError> {
+        let chunk_threshold =
+            (gen_config.audio_chunk_threshold.max(0.0) * self.frame_rate as f32).round() as usize;
+        if gen_config.audio_chunk_duration <= 0.0
+            || chunk_threshold == 0
+            || target_len <= chunk_threshold
+        {
+            return Ok(vec![self.generate_audio_tokens(
+                text, target_len, language, instruct, gen_config, None, None,
+            )?]);
+        }
+
+        let chunks = chunk_text_for_target(
+            text,
+            target_len,
+            self.frame_rate,
+            gen_config.audio_chunk_duration,
+        );
+        if chunks.len() <= 1 {
+            return Ok(vec![self.generate_audio_tokens(
+                text, target_len, language, instruct, gen_config, None, None,
+            )?]);
+        }
+
+        info!(
+            "OmniVoice chunking long request into {} chunks (estimated {} audio tokens)",
+            chunks.len(),
+            target_len
+        );
+
+        let first_target_len = estimate_target_tokens(&chunks[0], self.frame_rate);
+        let first_chunk = self.generate_audio_tokens(
+            &chunks[0],
+            first_target_len,
+            language,
+            instruct,
+            gen_config,
+            None,
+            None,
+        )?;
+
+        let mut generated = Vec::with_capacity(chunks.len());
+        generated.push(first_chunk.clone());
+
+        for chunk in chunks.iter().skip(1) {
+            let chunk_target_len = estimate_target_tokens_with_reference(
+                chunk,
+                Some(&chunks[0]),
+                Some(first_chunk.len),
+                1.0,
+            );
+            generated.push(self.generate_audio_tokens(
+                chunk,
+                chunk_target_len,
+                language,
+                instruct,
+                gen_config,
+                Some(&chunks[0]),
+                Some(&first_chunk),
+            )?);
+        }
+
+        Ok(generated)
+    }
+
+    fn generate_audio_tokens(
+        &self,
+        text: &str,
+        target_len: usize,
+        language: Option<&str>,
+        instruct: Option<&str>,
+        gen_config: &OmniVoiceGenerationConfig,
+        ref_text: Option<&str>,
+        ref_audio_tokens: Option<&GeneratedAudioTokens>,
+    ) -> Result<GeneratedAudioTokens, TtsError> {
+        let inputs = self.prepare_inference_inputs(
+            text,
+            target_len,
+            language,
+            instruct,
+            gen_config.denoise,
+            ref_text,
+            ref_audio_tokens,
+        )?;
+
+        let cond_len = inputs.seq_len;
+        let target_len = inputs.target_len;
+        let mask_id = self.config.audio_mask_id;
+        let total_masked = self.config.num_audio_codebook * target_len;
+        let schedule = build_schedule(total_masked, gen_config.num_step, gen_config.t_shift);
+        let use_causal_mask = std::env::var_os("OMNIVOICE_CAUSAL_MASK").is_some();
+        let cond_attention_mask = if use_causal_mask {
+            Some(self.causal_attention_mask(cond_len)?)
+        } else {
+            None
+        };
+        let uncond_attention_mask = if use_causal_mask {
+            Some(self.causal_attention_mask(target_len)?)
+        } else {
+            None
+        };
+
+        let mut cond_input_ids = inputs.input_ids.clone();
+        let mut uncond_input_ids = vec![mask_id; self.config.num_audio_codebook * target_len];
+
+        let cond_audio_mask_u32_values: Vec<u32> =
+            inputs.audio_mask.iter().copied().map(u32::from).collect();
+        let cond_audio_mask_f32_values: Vec<f32> =
+            inputs.audio_mask.iter().copied().map(f32::from).collect();
+        let cond_audio_mask_u32 =
+            Tensor::new(cond_audio_mask_u32_values.as_slice(), &self.compute_device)?
+                .reshape((1, cond_len))?;
+        let cond_audio_mask_f32 =
+            Tensor::new(cond_audio_mask_f32_values.as_slice(), &self.compute_device)?
+                .reshape((1, cond_len))?;
+        let uncond_audio_mask_u32 =
+            Tensor::ones((1, target_len), DType::U32, &self.compute_device)?;
+        let uncond_audio_mask_f32 =
+            Tensor::ones((1, target_len), DType::F32, &self.compute_device)?;
+        let mut tokens = vec![mask_id; self.config.num_audio_codebook * target_len];
+        let mut rng = SimpleRng::new(omnivoice_seed());
+        let layer_penalties: Vec<f32> = (0..self.config.num_audio_codebook)
+            .map(|layer| layer as f32 * gen_config.layer_penalty_factor)
+            .collect();
+        let mut step_trace = Vec::new();
+
+        for (step_index, step_k) in schedule.iter().copied().enumerate() {
+            if step_k == 0 {
+                continue;
+            }
+
+            let cond_input_ids_tensor = Tensor::new(
+                cond_input_ids.as_slice(),
+                &self.compute_device,
+            )?
+            .reshape((1, self.config.num_audio_codebook, cond_len))?;
+            let cond_logits = self
+                .backbone
+                .lock()
+                .map_err(|_| {
+                    TtsError::RuntimeError("OmniVoice model mutex was poisoned".to_string())
+                })?
+                .forward(
+                    &cond_input_ids_tensor,
+                    &cond_audio_mask_u32,
+                    &cond_audio_mask_f32,
+                    cond_attention_mask.as_ref(),
+                )?
+                .to_dtype(DType::F32)?
+                .i((0..1, .., cond_len - target_len..cond_len, ..))?;
+            let uncond_input_ids_tensor = Tensor::new(
+                uncond_input_ids.as_slice(),
+                &self.compute_device,
+            )?
+            .reshape((1, self.config.num_audio_codebook, target_len))?;
+            let u_logits = self
+                .backbone
+                .lock()
+                .map_err(|_| {
+                    TtsError::RuntimeError("OmniVoice model mutex was poisoned".to_string())
+                })?
+                .forward(
+                    &uncond_input_ids_tensor,
+                    &uncond_audio_mask_u32,
+                    &uncond_audio_mask_f32,
+                    uncond_attention_mask.as_ref(),
+                )?
+                .to_dtype(DType::F32)?;
+            let (pred_tokens, scores) =
+                self.predict_tokens_with_scoring(&cond_logits, &u_logits, gen_config, &mut rng)?;
+            maybe_dump_debug_first_step(&cond_logits, &u_logits, &pred_tokens, &scores)?;
+
+            let pred_tokens_flat = pred_tokens.flatten_all()?.to_vec1::<u32>()?;
+            let mut scores_flat = scores.flatten_all()?.to_vec1::<f32>()?;
+            for (layer_scores, penalty) in scores_flat
+                .chunks_exact_mut(target_len)
+                .zip(layer_penalties.iter().copied())
+            {
+                for score in layer_scores {
+                    *score -= penalty;
+                }
+            }
+
+            let chosen_positions = select_positions(
+                &scores_flat,
+                &tokens,
+                mask_id,
+                step_k,
+                gen_config.position_temperature,
+                &mut rng,
+            );
+            maybe_record_step_trace(
+                &mut step_trace,
+                step_index,
+                step_k,
+                &chosen_positions,
+                &pred_tokens_flat,
+                target_len,
+            );
+            for flat_index in chosen_positions {
+                tokens[flat_index] = pred_tokens_flat[flat_index];
+                let layer = flat_index / target_len;
+                let pos = flat_index % target_len;
+                cond_input_ids[index_2d(layer, cond_len - target_len + pos, cond_len)] =
+                    pred_tokens_flat[flat_index];
+                uncond_input_ids[index_2d(layer, pos, target_len)] = pred_tokens_flat[flat_index];
+            }
+        }
+
+        maybe_dump_step_trace(&step_trace)?;
+        maybe_dump_debug_tokens(&tokens, self.config.num_audio_codebook, target_len)?;
+
+        Ok(GeneratedAudioTokens {
+            tokens,
+            len: target_len,
+        })
+    }
+
+    fn decode_token_chunks(
+        &self,
+        token_chunks: &[GeneratedAudioTokens],
+    ) -> Result<Vec<f32>, TtsError> {
+        if token_chunks.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut audio_chunks = Vec::with_capacity(token_chunks.len());
+        for chunk in token_chunks {
+            let token_tensor = Tensor::new(chunk.tokens.as_slice(), &self.audio_device)?
+                .reshape((1, self.config.num_audio_codebook, chunk.len))?;
+            let waveform = self.audio_tokenizer.decode(&token_tensor)?;
+            let waveform = waveform.squeeze(1)?.squeeze(0)?.to_device(&Device::Cpu)?;
+            audio_chunks.push(waveform.to_vec1::<f32>()?);
+        }
+
+        Ok(cross_fade_chunks(
+            &audio_chunks,
+            self.sample_rate() as usize,
+        ))
+    }
+
     fn prepare_inference_inputs(
         &self,
         text: &str,
@@ -561,9 +692,11 @@ impl OmniVoiceModel {
         language: Option<&str>,
         instruct: Option<&str>,
         denoise: bool,
+        ref_text: Option<&str>,
+        ref_audio_tokens: Option<&GeneratedAudioTokens>,
     ) -> Result<InferenceInputs, TtsError> {
         let mut style_text = String::new();
-        if denoise {
+        if denoise && ref_audio_tokens.is_some() {
             style_text.push_str("<|denoise|>");
         }
         style_text.push_str("<|lang_start|>");
@@ -573,12 +706,13 @@ impl OmniVoiceModel {
         style_text.push_str(instruct.unwrap_or("None"));
         style_text.push_str("<|instruct_end|>");
 
-        let text_prompt = format!("<|text_start|>{}<|text_end|>", combine_text(text));
+        let text_prompt = format!("<|text_start|>{}<|text_end|>", combine_text(text, ref_text));
         let style_ids = self.tokenizer.encode(&style_text)?;
         let text_ids = self.tokenizer.encode(&text_prompt)?;
         let style_len = style_ids.len();
         let text_len = text_ids.len();
-        let seq_len = style_len + text_len + target_len;
+        let ref_len = ref_audio_tokens.map(|tokens| tokens.len).unwrap_or(0);
+        let seq_len = style_len + text_len + ref_len + target_len;
 
         let mut input_ids =
             vec![self.config.audio_mask_id; self.config.num_audio_codebook * seq_len];
@@ -591,8 +725,27 @@ impl OmniVoiceModel {
             }
         }
 
+        if let Some(ref_tokens) = ref_audio_tokens {
+            let expected_len = self.config.num_audio_codebook * ref_tokens.len;
+            if ref_tokens.tokens.len() != expected_len {
+                return Err(TtsError::RuntimeError(format!(
+                    "OmniVoice reference token length mismatch: expected {}, got {}",
+                    expected_len,
+                    ref_tokens.tokens.len()
+                )));
+            }
+            let ref_start = style_len + text_len;
+            for layer in 0..self.config.num_audio_codebook {
+                for pos in 0..ref_tokens.len {
+                    input_ids[index_2d(layer, ref_start + pos, seq_len)] =
+                        ref_tokens.tokens[index_2d(layer, pos, ref_tokens.len)];
+                }
+            }
+        }
+
         let mut audio_mask = vec![0u8; seq_len];
-        for audio_flag in audio_mask.iter_mut().skip(seq_len - target_len) {
+        let audio_start = seq_len - target_len - ref_len;
+        for audio_flag in audio_mask.iter_mut().skip(audio_start) {
             *audio_flag = 1;
         }
 
@@ -948,13 +1101,32 @@ fn top_k_summary(values: &[f32], count: usize) -> Vec<serde_json::Value> {
 }
 
 fn estimate_target_tokens(text: &str, frame_rate: usize) -> usize {
-    let ref_text = "Nice to meet you.";
-    let ref_tokens = frame_rate.max(1) as f32;
+    estimate_target_tokens_with_reference(
+        text,
+        Some("Nice to meet you."),
+        Some(frame_rate.max(1)),
+        1.0,
+    )
+}
+
+fn estimate_target_tokens_with_reference(
+    text: &str,
+    ref_text: Option<&str>,
+    ref_audio_tokens: Option<usize>,
+    speed: f32,
+) -> usize {
+    let ref_text = ref_text
+        .filter(|text| !text.is_empty())
+        .unwrap_or("Nice to meet you.");
+    let ref_tokens = ref_audio_tokens.unwrap_or(25).max(1) as f32;
     let ref_weight = text_weight(ref_text).max(1.0);
     let target_weight = text_weight(text).max(1.0);
     let mut estimate = target_weight / (ref_weight / ref_tokens);
     if estimate < 50.0 {
         estimate = 50.0 * (estimate / 50.0).powf(1.0 / 3.0);
+    }
+    if speed > 0.0 && speed != 1.0 {
+        estimate /= speed;
     }
     estimate.max(1.0).round() as usize
 }
@@ -986,30 +1158,216 @@ fn char_weight(ch: char) -> f32 {
     }
 }
 
-fn combine_text(text: &str) -> String {
-    let chars: Vec<char> = text.trim().chars().collect();
-    let mut normalized = String::with_capacity(chars.len());
-    for (index, ch) in chars.iter().copied().enumerate() {
-        if ch == '\n' || ch == '\r' {
-            if !normalized.ends_with('.') {
-                normalized.push('.');
+fn chunk_text_for_target(
+    text: &str,
+    target_len: usize,
+    frame_rate: usize,
+    chunk_duration: f32,
+) -> Vec<String> {
+    let char_count = text.chars().count().max(1);
+    let avg_tokens_per_char = target_len as f32 / char_count as f32;
+    let chunk_len = (chunk_duration.max(0.1) * frame_rate.max(1) as f32 / avg_tokens_per_char)
+        .max(1.0)
+        .floor() as usize;
+    chunk_text_punctuation(text, chunk_len, Some(3))
+}
+
+fn chunk_text_punctuation(
+    text: &str,
+    chunk_len: usize,
+    min_chunk_len: Option<usize>,
+) -> Vec<String> {
+    let chunk_len = chunk_len.max(1);
+    let mut sentences: Vec<Vec<char>> = Vec::new();
+    let mut current_sentence: Vec<char> = Vec::new();
+
+    for token in text.chars() {
+        if current_sentence.is_empty()
+            && !sentences.is_empty()
+            && (is_split_punctuation(token) || is_closing_mark(token))
+        {
+            sentences.last_mut().expect("checked non-empty").push(token);
+        } else {
+            current_sentence.push(token);
+            if is_split_punctuation(token)
+                && !(token == '.' && sentence_ends_with_abbreviation(&current_sentence))
+            {
+                sentences.push(std::mem::take(&mut current_sentence));
             }
-            continue;
         }
+    }
+    if !current_sentence.is_empty() {
+        sentences.push(current_sentence);
+    }
+
+    let mut merged_chunks: Vec<Vec<char>> = Vec::new();
+    let mut current_chunk: Vec<char> = Vec::new();
+    for sentence in sentences {
+        if current_chunk.len() + sentence.len() <= chunk_len {
+            current_chunk.extend(sentence);
+        } else {
+            if !current_chunk.is_empty() {
+                merged_chunks.push(current_chunk);
+            }
+            current_chunk = sentence;
+        }
+    }
+    if !current_chunk.is_empty() {
+        merged_chunks.push(current_chunk);
+    }
+
+    let final_chunks = if let Some(min_chunk_len) = min_chunk_len {
+        let first_chunk_short = merged_chunks
+            .first()
+            .is_some_and(|chunk| chunk.len() < min_chunk_len);
+        let mut final_chunks: Vec<Vec<char>> = Vec::new();
+        for (index, chunk) in merged_chunks.into_iter().enumerate() {
+            if index == 1 && first_chunk_short {
+                if let Some(previous) = final_chunks.last_mut() {
+                    previous.extend(chunk);
+                } else {
+                    final_chunks.push(chunk);
+                }
+            } else if chunk.len() >= min_chunk_len || final_chunks.is_empty() {
+                final_chunks.push(chunk);
+            } else if let Some(previous) = final_chunks.last_mut() {
+                previous.extend(chunk);
+            }
+        }
+        final_chunks
+    } else {
+        merged_chunks
+    };
+
+    final_chunks
+        .into_iter()
+        .map(|chunk| chunk.into_iter().collect::<String>().trim().to_string())
+        .filter(|chunk| !chunk.is_empty())
+        .collect()
+}
+
+fn is_split_punctuation(ch: char) -> bool {
+    matches!(
+        ch,
+        '.' | ',' | ';' | ':' | '!' | '?' | '。' | '，' | '；' | '：' | '！' | '？'
+    )
+}
+
+fn is_closing_mark(ch: char) -> bool {
+    matches!(
+        ch,
+        '"' | '\'' | ')' | ']' | '>' | '）' | '》' | '」' | '】' | '”' | '’'
+    )
+}
+
+fn sentence_ends_with_abbreviation(sentence: &[char]) -> bool {
+    let text = sentence.iter().collect::<String>();
+    let Some(last_word) = text.split_whitespace().last() else {
+        return false;
+    };
+    is_abbreviation(last_word)
+}
+
+fn is_abbreviation(word: &str) -> bool {
+    matches!(
+        word,
+        "Mr."
+            | "Mrs."
+            | "Ms."
+            | "Dr."
+            | "Prof."
+            | "Sr."
+            | "Jr."
+            | "Rev."
+            | "Fr."
+            | "Hon."
+            | "Pres."
+            | "Gov."
+            | "Capt."
+            | "Gen."
+            | "Sen."
+            | "Rep."
+            | "Col."
+            | "Maj."
+            | "Lt."
+            | "Cmdr."
+            | "Sgt."
+            | "Cpl."
+            | "Co."
+            | "Corp."
+            | "Inc."
+            | "Ltd."
+            | "Est."
+            | "Dept."
+            | "St."
+            | "Ave."
+            | "Blvd."
+            | "Rd."
+            | "Mt."
+            | "Ft."
+            | "No."
+            | "Jan."
+            | "Feb."
+            | "Mar."
+            | "Apr."
+            | "Aug."
+            | "Sep."
+            | "Sept."
+            | "Oct."
+            | "Nov."
+            | "Dec."
+            | "i.e."
+            | "e.g."
+            | "vs."
+            | "Vs."
+            | "Etc."
+            | "approx."
+            | "fig."
+            | "def."
+    )
+}
+
+fn combine_text(text: &str, ref_text: Option<&str>) -> String {
+    let mut full_text = if let Some(ref_text) = ref_text.filter(|text| !text.trim().is_empty()) {
+        format!("{} {}", ref_text.trim(), text.trim())
+    } else {
+        text.trim().to_string()
+    };
+
+    full_text = full_text
+        .chars()
+        .filter(|ch| *ch != '\n' && *ch != '\r')
+        .collect();
+    full_text = full_text.replace('（', "(").replace('）', ")");
+
+    let mut collapsed = String::with_capacity(full_text.len());
+    let mut previous_was_space = false;
+    for ch in full_text.chars() {
+        if ch == ' ' || ch == '\t' {
+            if !previous_was_space {
+                collapsed.push(' ');
+            }
+            previous_was_space = true;
+        } else {
+            collapsed.push(ch);
+            previous_was_space = false;
+        }
+    }
+
+    let chars: Vec<char> = collapsed.chars().collect();
+    let mut normalized = String::with_capacity(collapsed.len());
+    for (index, ch) in chars.iter().copied().enumerate() {
         if ch.is_whitespace() {
             let prev_is_cjk = index > 0 && is_cjk(chars[index - 1]);
             let next_is_cjk = chars.get(index + 1).copied().is_some_and(is_cjk);
             if prev_is_cjk || next_is_cjk {
                 continue;
             }
-            if !normalized.ends_with(' ') {
-                normalized.push(' ');
-            }
-            continue;
         }
         normalized.push(ch);
     }
-    normalized.trim().to_string()
+
+    normalized
 }
 
 fn normalize_instruct(instruct: Option<&str>, text: &str) -> Option<String> {
@@ -1043,7 +1401,49 @@ fn is_cjk(ch: char) -> bool {
     matches!(ch as u32, 0x4E00..=0x9FFF | 0x3400..=0x4DBF | 0xF900..=0xFAFF)
 }
 
-fn post_process_audio(samples: &mut Vec<f32>) {
+fn cross_fade_chunks(chunks: &[Vec<f32>], sample_rate: usize) -> Vec<f32> {
+    if chunks.len() <= 1 {
+        return chunks.first().cloned().unwrap_or_default();
+    }
+
+    let total_n = (0.3 * sample_rate as f32) as usize;
+    let fade_n = total_n / 3;
+    let silence_n = fade_n;
+    let mut merged = chunks[0].clone();
+
+    for chunk in chunks.iter().skip(1) {
+        let fout_n = fade_n.min(merged.len());
+        if fout_n > 0 {
+            let start = merged.len() - fout_n;
+            for index in 0..fout_n {
+                merged[start + index] *= linspace_weight(1.0, 0.0, index, fout_n);
+            }
+        }
+
+        merged.extend(std::iter::repeat_n(0.0, silence_n));
+
+        let mut fade_in = chunk.clone();
+        let fin_n = fade_n.min(fade_in.len());
+        if fin_n > 0 {
+            for (index, sample) in fade_in.iter_mut().take(fin_n).enumerate() {
+                *sample *= linspace_weight(0.0, 1.0, index, fin_n);
+            }
+        }
+        merged.extend(fade_in);
+    }
+
+    merged
+}
+
+fn linspace_weight(start: f32, end: f32, index: usize, count: usize) -> f32 {
+    if count <= 1 {
+        start
+    } else {
+        start + (end - start) * index as f32 / (count - 1) as f32
+    }
+}
+
+fn post_process_audio(samples: &mut Vec<f32>, sample_rate: u32) {
     let peak = samples.iter().copied().map(f32::abs).fold(0.0f32, f32::max);
     if peak > 1e-6 {
         let scale = 0.5 / peak;
@@ -1052,20 +1452,47 @@ fn post_process_audio(samples: &mut Vec<f32>) {
         }
     }
 
-    let fade = samples.len().min(256);
+    let fade = (sample_rate as usize / 10).min(samples.len() / 2);
     for index in 0..fade {
-        let weight = index as f32 / fade.max(1) as f32;
+        let weight = linspace_weight(0.0, 1.0, index, fade);
         samples[index] *= weight;
         let tail = samples.len() - 1 - index;
-        samples[tail] *= weight;
+        samples[tail] *= linspace_weight(1.0, 0.0, index, fade);
     }
 
-    let pad = 256usize;
+    let pad = sample_rate as usize / 10;
     let mut padded = Vec::with_capacity(samples.len() + pad * 2);
     padded.extend(std::iter::repeat_n(0.0, pad));
     padded.extend(samples.iter().copied());
     padded.extend(std::iter::repeat_n(0.0, pad));
     *samples = padded;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn combine_text_matches_upstream_cleanup() {
+        assert_eq!(
+            combine_text("  Hello\nworld\t again  ", Some("Reference.")),
+            "Reference. Helloworld again"
+        );
+        assert_eq!(combine_text("你 好 （test）", None), "你好(test)");
+    }
+
+    #[test]
+    fn chunk_text_punctuation_keeps_abbreviations() {
+        let chunks = chunk_text_punctuation("Dr. Smith arrived. He left.", 18, Some(3));
+        assert_eq!(chunks, vec!["Dr. Smith arrived.", "He left."]);
+    }
+
+    #[test]
+    fn cross_fade_chunks_adds_official_gap() {
+        let merged = cross_fade_chunks(&[vec![1.0; 10], vec![1.0; 10]], 30);
+        assert_eq!(merged.len(), 23);
+        assert_eq!(&merged[10..13], &[0.0, 0.0, 0.0]);
+    }
 }
 
 fn index_2d(row: usize, col: usize, cols: usize) -> usize {

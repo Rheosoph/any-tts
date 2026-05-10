@@ -147,9 +147,14 @@ impl TtsModel for Qwen3TtsModel {
         self.validate_request(request)?;
 
         let token_ids = self.tokenize_text(&request.text)?;
+        let instruct_token_ids = self.tokenize_instruct(request.instruct.as_deref())?;
         let (speaker_id, language_id) = self.resolve_speaker_language(request);
-        let (full_input, trailing_text_hidden) =
-            self.build_input_embeddings(&token_ids, speaker_id, language_id)?;
+        let (full_input, trailing_text_hidden) = self.build_input_embeddings(
+            &token_ids,
+            instruct_token_ids.as_deref(),
+            speaker_id,
+            language_id,
+        )?;
 
         info!("Input sequence shape: {:?}", full_input.shape());
 
@@ -274,7 +279,14 @@ impl Qwen3TtsModel {
             ));
         }
 
-        if !self.config.is_voice_design() {
+        if self.config.is_voice_design() {
+            if request.voice.is_some() {
+                return Err(TtsError::ModelError(
+                    "Qwen3-TTS VoiceDesign uses `instruct` descriptions instead of named speakers."
+                        .to_string(),
+                ));
+            }
+        } else {
             if let Some(ref voice) = request.voice {
                 if !self.config.talker_config.spk_id.contains_key(voice) {
                     return Err(TtsError::UnknownVoice(voice.clone()));
@@ -329,6 +341,25 @@ impl Qwen3TtsModel {
         Ok(token_ids)
     }
 
+    /// Tokenize an optional voice/style instruction using the upstream user-role template.
+    fn tokenize_instruct(&self, instruct: Option<&str>) -> Result<Option<Vec<u32>>, TtsError> {
+        let Some(instruct) = instruct.map(str::trim).filter(|s| !s.is_empty()) else {
+            return Ok(None);
+        };
+
+        let tokenizer_path = self
+            .files
+            .tokenizer
+            .as_ref()
+            .expect("validated by resolve_files");
+        let tokenizer = TextTokenizer::from_asset(tokenizer_path)?;
+
+        let template_text = format!("<|im_start|>user\n{}<|im_end|>\n", instruct);
+        let token_ids = tokenizer.encode(&template_text)?;
+        info!("Tokenized {} instruction tokens", token_ids.len());
+        Ok(Some(token_ids))
+    }
+
     /// Resolve speaker and language IDs from the request.
     fn resolve_speaker_language(&self, request: &SynthesisRequest) -> (Option<u32>, Option<u32>) {
         let speaker_id = request
@@ -361,6 +392,7 @@ impl Qwen3TtsModel {
     fn build_input_embeddings(
         &self,
         token_ids: &[u32],
+        instruct_token_ids: Option<&[u32]>,
         speaker_id: Option<u32>,
         language_id: Option<u32>,
     ) -> Result<(Tensor, Tensor), TtsError> {
@@ -493,6 +525,21 @@ impl Qwen3TtsModel {
         let combined = text_embeds
             .add(&masked_codec)
             .map_err(TtsError::ComputeError)?;
+
+        let combined = if let Some(instruct_token_ids) =
+            instruct_token_ids.filter(|tokens| !tokens.is_empty())
+        {
+            let instruct_ids_tensor = Tensor::new(instruct_token_ids, &self.device)
+                .map_err(TtsError::ComputeError)?
+                .unsqueeze(0)
+                .map_err(TtsError::ComputeError)?;
+            let instruct_embeds = talker
+                .embed_text(&instruct_ids_tensor)
+                .map_err(TtsError::ComputeError)?;
+            Tensor::cat(&[&instruct_embeds, &combined], 1).map_err(TtsError::ComputeError)?
+        } else {
+            combined
+        };
 
         // Compute trailing_text_hidden: text embedding added at each generation step.
         //

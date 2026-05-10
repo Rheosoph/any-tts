@@ -10,6 +10,7 @@
 use any_tts::models::omnivoice::preferred_runtime_choice;
 use any_tts::{load_model, ModelType, SynthesisRequest, TtsConfig};
 use serde::Deserialize;
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -30,8 +31,43 @@ fn load_example_config() -> OmniVoiceExampleConfig {
         .unwrap_or_else(|err| panic!("Failed to parse {}: {err}", path.display()))
 }
 
+fn load_runtime_config() -> OmniVoiceExampleConfig {
+    let mut example = load_example_config();
+
+    if let Some(text_path) = env_override("OMNIVOICE_TEXT_FILE") {
+        example.text = fs::read_to_string(&text_path)
+            .unwrap_or_else(|err| panic!("Failed to read {}: {err}", text_path));
+    }
+    if let Some(text) = env_override("OMNIVOICE_TEXT") {
+        example.text = text;
+    }
+    if let Some(language) = env_override("OMNIVOICE_LANGUAGE") {
+        example.language = language;
+    }
+    if let Some(instruct) = env_override("OMNIVOICE_INSTRUCT") {
+        example.instruct = instruct;
+    }
+    if let Some(cfg_scale) = env_override("OMNIVOICE_CFG_SCALE") {
+        example.cfg_scale = cfg_scale
+            .parse::<f64>()
+            .unwrap_or_else(|_| panic!("Invalid OMNIVOICE_CFG_SCALE value: {cfg_scale}"));
+    }
+    if let Some(output) = env_override("OMNIVOICE_OUTPUT") {
+        example.output = output;
+    }
+
+    example
+}
+
+fn env_override(name: &str) -> Option<String> {
+    env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 fn main() {
-    let example = load_example_config();
+    let example = load_runtime_config();
     let runtime = preferred_runtime_choice();
     let model = load_model(
         TtsConfig::new(ModelType::OmniVoice)
@@ -61,6 +97,9 @@ fn main() {
         .save_wav(Path::new(&example.output))
         .expect("Failed to write WAV");
 
+    println!("  Language   : {}", example.language);
+    println!("  Instruct   : {}", example.instruct);
+    println!("  Text chars : {}", example.text.chars().count());
     println!(
         "Saved OmniVoice sample to {} using {} ({} samples @ {} Hz)",
         example.output,
