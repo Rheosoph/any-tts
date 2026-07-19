@@ -83,6 +83,7 @@ voxtral = []
 download = ["dep:reqwest"]
 
 [dependencies]
+voice-g2p = "0.2.2"
 base64 = "0.22"
 candle-core = "0.10.2"
 candle-nn = "0.10.2"

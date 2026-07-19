@@ -72,22 +72,58 @@ fn filter_to_vocab(phonemes: &str, vocab: &HashMap<String, u32>) -> String {
         .collect()
 }
 
+fn phonemize_token_hybrid(word: &str, espeak_lang: &str, vocab: &HashMap<String, u32>) -> String {
+    voice_g2p::english_to_phonemes(word)
+        .ok()
+        .filter(|p| !p.trim().is_empty() && p.chars().any(|c| c.is_alphabetic() || vocab.contains_key(&c.to_string())))
+        .unwrap_or_else(|| {
+            text_to_phonemes(word, espeak_lang, None, true, false)
+                .map(|p| p.join(""))
+                .unwrap_or_default()
+        })
+}
+
 /// Convert plain text to Kokoro-compatible IPA phoneme string.
 ///
 /// Pipeline:
-/// 1. Use the pure-Rust `espeak-rs` compatibility layer for the requested language
-/// 2. Apply Kokoro-specific cleanup
-/// 3. Filter to only characters in the Kokoro vocab
+/// 1. For English, run the hybrid G2P pipeline (phonemize_token_hybrid custom rules + espeak fallback)
+/// 2. For other languages, use the pure-Rust `espeak-rs` compatibility layer
+/// 3. Apply Kokoro-specific cleanup
+/// 4. Filter to only characters in the Kokoro vocab
 pub fn phonemize(text: &str, language: &str, vocab: &HashMap<String, u32>) -> TtsResult<String> {
     let espeak_lang = lang_to_espeak(language);
 
-    let raw_phonemes = text_to_phonemes(text, espeak_lang, None, true, false).map_err(|e| {
-        TtsError::ModelError(format!(
-            "pure-Rust phonemization failed for lang '{language}' (compat voice '{espeak_lang}'): {e}"
-        ))
-    })?;
+    // English spelling is highly non-phonetic and requires a G2P dictionary lookup (voice-g2p)
+    // to avoid robotic espeak accents. Other languages are highly phonetic or rules-consistent,
+    // so they are phonemized at the sentence level to preserve natural word linking (liaison).
+    let joined = if espeak_lang == "en-us" || espeak_lang == "en-gb" {
+        // Hybrid G2P: convert word-by-word to preserve OOV terms (like names or code symbols)
+        let mut output = String::new();
+        let mut token = String::new();
+        for ch in text.chars() {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '\'' | '’' | '-') {
+                token.push(ch);
+            } else {
+                if !token.is_empty() {
+                    output.push_str(&phonemize_token_hybrid(&token, espeak_lang, vocab));
+                    token.clear();
+                }
+                output.push(ch);
+            }
+        }
+        if !token.is_empty() {
+            output.push_str(&phonemize_token_hybrid(&token, espeak_lang, vocab));
+        }
+        output
+    } else {
+        let raw_phonemes = text_to_phonemes(text, espeak_lang, None, true, false).map_err(|e| {
+            TtsError::ModelError(format!(
+                "pure-Rust phonemization failed for lang '{language}' (compat voice '{espeak_lang}'): {e}"
+            ))
+        })?;
+        raw_phonemes.join("")
+    };
 
-    let joined = raw_phonemes.join("");
     let replaced = apply_kokoro_replacements(&joined);
     let filtered = filter_to_vocab(&replaced, vocab);
 
