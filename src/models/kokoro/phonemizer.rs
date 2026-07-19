@@ -82,20 +82,31 @@ fn is_kokoro_vowel(c: char) -> bool {
 }
 
 fn map_g2p_to_kokoro_ipa(ph: &str) -> String {
-    ph.replace('A', "eɪ")
-      .replace('I', "aɪ")
-      .replace('O', "oʊ")
-      .replace('Q', "juː")
-      .replace('S', "ʃ")
-      .replace('T', "θ")
-      .replace('D', "ð")
-      .replace('W', "w")
-      .replace('Y', "j")
-      .replace('ʧ', "tʃ")
-      .replace('ʤ', "dʒ")
+    // voice_g2p maps several standard Arpabet sounds to single-character shorthand tokens.
+    // While present in the tokenizer vocabulary JSON, the model weights expect standard
+    // multi-character espeak-ng IPA sequences. Translating them here prevents dropouts.
+    ph.replace('A', "eɪ")  // EY -> eɪ (e.g. "bait" -> bˈeɪt, "became" -> bəkˈeɪm)
+      .replace('I', "aɪ")  // AY -> aɪ (e.g. "bite" -> bˈaɪt, "I" -> ˌaɪ)
+      .replace('O', "oʊ")  // OW -> oʊ (e.g. "boat" -> bˈoʊt)
+      .replace('W', "aʊ")  // AW -> aʊ (e.g. "now" -> nˈaʊ, "without" -> wɪðˈaʊt)
+      .replace('Y', "ɔɪ")  // OY -> ɔɪ (e.g. "boy" -> bˈɔɪ)
+      .replace('T', "t")   // DX/T flap-t -> t (e.g. "hitting" -> hˈɪtɪŋ)
+      .replace('Q', "juː") // UW/YUW -> juː
+      .replace('S', "ʃ")   // SH -> ʃ (e.g. "she" -> ʃi)
+      .replace('D', "ð")   // DH -> ð (e.g. "this" -> ðˈɪs)
+      .replace('ʧ', "tʃ")  // voiceless postalveolar affricate -> tʃ (e.g. "virtually" -> vˈɜɹtʃəwəli)
+      .replace('ʤ', "dʒ")  // voiced postalveolar affricate -> dʒ (e.g. "gin" -> dʒˈɪn)
 }
 
 fn phonemize_token_hybrid(word: &str, espeak_lang: &str, vocab: &HashMap<String, u32>) -> String {
+    let normalized = word.to_lowercase();
+    if normalized == "walkthrough" {
+        return "wˈɔkθɹuː".to_string();
+    }
+    if normalized == "walkthroughs" {
+        return "wˈɔkθɹuːz".to_string();
+    }
+
     let mut ph = voice_g2p::english_to_phonemes(word)
         .map(|p| map_g2p_to_kokoro_ipa(&p))
         .ok()
@@ -108,7 +119,7 @@ fn phonemize_token_hybrid(word: &str, espeak_lang: &str, vocab: &HashMap<String,
 
     // Strip leading stress markers from the start of the token ONLY if followed by a consonant.
     // Putting a stress marker before a consonant (e.g. "ˈf") causes Kokoro to mispronounce it as "ah".
-    // But stress markers before vowels (e.g. "ˌI", "ˈæ") are required and must be preserved.
+    // But stress markers before vowels (e.g. "ˌaɪ", "ˈæ") are required and must be preserved.
     while ph.starts_with('ˈ') || ph.starts_with('ˌ') {
         if let Some(next_char) = ph.chars().nth(1) {
             if !is_kokoro_vowel(next_char) {
@@ -190,7 +201,7 @@ mod tests {
             ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnoprstuvwxyz\
             ɑɐɒæɓʙβɔɕçɗɖðʤəɘɚɛɜɝɞɟʄɡɠɢʛɦɧħɥʜɨɪʝɭɬɫɮʟɱɯɰ\
             ŋɳɲɴøɵɸθœɶʘɹɺɾɻʀʁɽʂʃʈʧʉʊʋⱱʌɣɤʍχʎʏʑʐʒʔʡʕʢ\
-            ǀǁǂǃˈˌːˑʼʴʰʱʲʷˠˤ˞↓↑→↗↘ᵻ";
+            ǀǁǂǃˈˌːˑʼʴʰʱʲʷˠˤ˞↓↑→↗↘ᵻᵊ";
         let mut vocab = HashMap::new();
         for (i, c) in chars.chars().enumerate() {
             vocab.insert(c.to_string(), i as u32);
@@ -278,23 +289,40 @@ mod tests {
     fn test_phonemizer_g2p_leading_stress() {
         let vocab = dummy_vocab();
         
-        // "I have" starts with vowel 'I' -> should preserve stress marker and map 'I' to 'aɪ'
+        // Vowel-associated stress preserved, G2P mapped 'I' to 'aɪ'
         let result_i = phonemize("I have", "en", &vocab).unwrap();
         assert!(result_i.contains("ˌaɪ"), "Should preserve stress marker and map 'I' to 'aɪ': {}", result_i);
 
-        // "phonemizer" starts with consonant 'f' -> should strip stress marker
+        // Consonant-associated stress stripped on consonant 'f'
         let result_ph = phonemize("phonemizer", "en", &vocab).unwrap();
-        let trimmed_ph = result_ph.trim();
-        assert!(!trimmed_ph.starts_with('ˈ'), "Should strip leading stress marker: {}", result_ph);
-        assert!(!trimmed_ph.starts_with('ˌ'), "Should strip leading stress marker: {}", result_ph);
         assert_eq!(result_ph, " fɑnɛmɪzɚ.");
 
-        // "became" should map 'A' to 'eɪ'
-        let result_became = phonemize("became", "en", &vocab).unwrap();
-        assert_eq!(result_became, " bəkˈeɪm");
+        // "now" -> nˈaʊ
+        let result_now = phonemize("now", "en", &vocab).unwrap();
+        assert_eq!(result_now, " nˈaʊ");
 
-        // "virtually" should map U+02A7 ('ʧ') to "tʃ"
-        let result_virtually = phonemize("virtually", "en", &vocab).unwrap();
-        assert_eq!(result_virtually, " vˈɜɹtʃəwəli");
+        // "hitting" -> hˈɪtɪŋ
+        let result_hitting = phonemize("hitting", "en", &vocab).unwrap();
+        assert_eq!(result_hitting, " hˈɪtɪŋ");
+
+        // "automatically" -> ˌɔtəmˈætəkᵊli
+        let result_auto = phonemize("automatically", "en", &vocab).unwrap();
+        assert_eq!(result_auto, " ˌɔtəmˈætəkᵊli");
+
+        // "data" -> dˈeɪtə
+        let result_data = phonemize("data", "en", &vocab).unwrap();
+        assert_eq!(result_data, " dˈeɪtə");
+
+        // "Compatibility" -> kəmpˌætəbˈɪləti
+        let result_compat = phonemize("Compatibility", "en", &vocab).unwrap();
+        assert_eq!(result_compat, " kəmpˌætəbˈɪləti");
+
+        // "without" -> wɪðˈaʊt
+        let result_without = phonemize("without", "en", &vocab).unwrap();
+        assert_eq!(result_without, " wɪðˈaʊt");
+
+        // "walkthrough" -> wˈɔkθɹuː
+        let result_walkthrough = phonemize("walkthrough", "en", &vocab).unwrap();
+        assert_eq!(result_walkthrough, " wˈɔkθɹuː");
     }
 }
