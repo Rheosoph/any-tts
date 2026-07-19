@@ -72,15 +72,53 @@ fn filter_to_vocab(phonemes: &str, vocab: &HashMap<String, u32>) -> String {
         .collect()
 }
 
+fn is_kokoro_vowel(c: char) -> bool {
+    matches!(
+        c,
+        'a' | 'e' | 'i' | 'o' | 'u'
+            | 'ɑ' | 'ɐ' | 'ɒ' | 'æ' | 'ɔ' | 'ə' | 'ɚ' | 'ɛ' | 'ɜ' | 'ɨ' | 'ɪ' | 'ɯ' | 'ʌ' | 'ɣ' | 'ɤ' | 'ʊ' | 'ʏ'
+            | 'A' | 'I' | 'O' | 'Q' | 'S' | 'T' | 'W' | 'Y' | 'ᵻ'
+    )
+}
+
+fn map_g2p_to_kokoro_ipa(ph: &str) -> String {
+    ph.replace('A', "eɪ")
+      .replace('I', "aɪ")
+      .replace('O', "oʊ")
+      .replace('Q', "juː")
+      .replace('S', "ʃ")
+      .replace('T', "θ")
+      .replace('D', "ð")
+      .replace('W', "w")
+      .replace('Y', "j")
+      .replace('ʧ', "tʃ")
+      .replace('ʤ', "dʒ")
+}
+
 fn phonemize_token_hybrid(word: &str, espeak_lang: &str, vocab: &HashMap<String, u32>) -> String {
-    voice_g2p::english_to_phonemes(word)
+    let mut ph = voice_g2p::english_to_phonemes(word)
+        .map(|p| map_g2p_to_kokoro_ipa(&p))
         .ok()
         .filter(|p| !p.trim().is_empty() && p.chars().any(|c| c.is_alphabetic() || vocab.contains_key(&c.to_string())))
         .unwrap_or_else(|| {
             text_to_phonemes(word, espeak_lang, None, true, false)
                 .map(|p| p.join(""))
                 .unwrap_or_default()
-        })
+        });
+
+    // Strip leading stress markers from the start of the token ONLY if followed by a consonant.
+    // Putting a stress marker before a consonant (e.g. "ˈf") causes Kokoro to mispronounce it as "ah".
+    // But stress markers before vowels (e.g. "ˌI", "ˈæ") are required and must be preserved.
+    while ph.starts_with('ˈ') || ph.starts_with('ˌ') {
+        if let Some(next_char) = ph.chars().nth(1) {
+            if !is_kokoro_vowel(next_char) {
+                ph.remove(0);
+                continue;
+            }
+        }
+        break;
+    }
+    ph
 }
 
 /// Convert plain text to Kokoro-compatible IPA phoneme string.
@@ -125,12 +163,18 @@ pub fn phonemize(text: &str, language: &str, vocab: &HashMap<String, u32>) -> Tt
     };
 
     let replaced = apply_kokoro_replacements(&joined);
-    let filtered = filter_to_vocab(&replaced, vocab);
+    let mut filtered = filter_to_vocab(&replaced, vocab);
 
     if filtered.is_empty() {
         return Err(TtsError::TokenizerError(format!(
             "Phonemization produced no valid tokens for text: \"{text}\" (lang: {language})"
         )));
+    }
+
+    // Prepend a leading space to ensure there is a tiny silent pad at the start of the audio.
+    // This prevents the first word (like "I" or "A") from being clipped due to browser/OS audio device wakeup latency.
+    if !filtered.starts_with(' ') {
+        filtered = format!(" {filtered}");
     }
 
     Ok(filtered)
@@ -228,5 +272,29 @@ mod tests {
         vocab.insert("a".to_string(), 1);
         vocab.insert("b".to_string(), 2);
         assert_eq!(filter_to_vocab("abc", &vocab), "ab");
+    }
+
+    #[test]
+    fn test_phonemizer_g2p_leading_stress() {
+        let vocab = dummy_vocab();
+        
+        // "I have" starts with vowel 'I' -> should preserve stress marker and map 'I' to 'aɪ'
+        let result_i = phonemize("I have", "en", &vocab).unwrap();
+        assert!(result_i.contains("ˌaɪ"), "Should preserve stress marker and map 'I' to 'aɪ': {}", result_i);
+
+        // "phonemizer" starts with consonant 'f' -> should strip stress marker
+        let result_ph = phonemize("phonemizer", "en", &vocab).unwrap();
+        let trimmed_ph = result_ph.trim();
+        assert!(!trimmed_ph.starts_with('ˈ'), "Should strip leading stress marker: {}", result_ph);
+        assert!(!trimmed_ph.starts_with('ˌ'), "Should strip leading stress marker: {}", result_ph);
+        assert_eq!(result_ph, " fɑnɛmɪzɚ.");
+
+        // "became" should map 'A' to 'eɪ'
+        let result_became = phonemize("became", "en", &vocab).unwrap();
+        assert_eq!(result_became, " bəkˈeɪm");
+
+        // "virtually" should map U+02A7 ('ʧ') to "tʃ"
+        let result_virtually = phonemize("virtually", "en", &vocab).unwrap();
+        assert_eq!(result_virtually, " vˈɜɹtʃəwəli");
     }
 }
