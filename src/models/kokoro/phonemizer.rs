@@ -100,11 +100,10 @@ fn map_g2p_to_kokoro_ipa(ph: &str) -> String {
 
 fn phonemize_token_hybrid(word: &str, espeak_lang: &str, vocab: &HashMap<String, u32>) -> String {
     let normalized = word.to_lowercase();
-    if normalized == "walkthrough" {
-        return "wˈɔkθɹuː".to_string();
-    }
-    if normalized == "walkthroughs" {
-        return "wˈɔkθɹuːz".to_string();
+
+    if let Some(ipa) = super::english_g2p::lookup_dialect_word(&normalized, espeak_lang == "en-gb")
+    {
+        return map_g2p_to_kokoro_ipa(ipa);
     }
 
     let mut ph = voice_g2p::english_to_phonemes(word)
