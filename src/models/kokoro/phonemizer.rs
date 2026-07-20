@@ -158,7 +158,7 @@ pub fn phonemize(text: &str, language: &str, vocab: &HashMap<String, u32>) -> Tt
         let mut output = String::new();
         let mut token = String::new();
         for ch in text.chars() {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '\'' | '’' | '-') {
+            if ch.is_alphanumeric() || matches!(ch, '\'' | '’' | '-') {
                 token.push(ch);
             } else {
                 if !token.is_empty() {
