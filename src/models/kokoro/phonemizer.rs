@@ -110,7 +110,15 @@ fn phonemize_token_hybrid(word: &str, espeak_lang: &str, vocab: &HashMap<String,
     let mut ph = voice_g2p::english_to_phonemes(word)
         .map(|p| map_g2p_to_kokoro_ipa(&p))
         .ok()
-        .filter(|p| !p.trim().is_empty() && p.chars().any(|c| c.is_alphabetic() || vocab.contains_key(&c.to_string())))
+        .filter(|p| {
+            !p.trim().is_empty()
+                && p.chars().any(|c| {
+                    c.is_alphabetic() || {
+                        let mut buf = [0; 4];
+                        vocab.contains_key(c.encode_utf8(&mut buf))
+                    }
+                })
+        })
         .unwrap_or_else(|| {
             text_to_phonemes(word, espeak_lang, None, true, false)
                 .map(|p| p.join(""))
