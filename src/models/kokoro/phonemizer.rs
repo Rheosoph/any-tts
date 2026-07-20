@@ -181,18 +181,12 @@ pub fn phonemize(text: &str, language: &str, vocab: &HashMap<String, u32>) -> Tt
     };
 
     let replaced = apply_kokoro_replacements(&joined);
-    let mut filtered = filter_to_vocab(&replaced, vocab);
+    let filtered = filter_to_vocab(&replaced, vocab);
 
     if filtered.is_empty() {
         return Err(TtsError::TokenizerError(format!(
             "Phonemization produced no valid tokens for text: \"{text}\" (lang: {language})"
         )));
-    }
-
-    // Prepend a leading space to ensure there is a tiny silent pad at the start of the audio.
-    // This prevents the first word (like "I" or "A") from being clipped due to browser/OS audio device wakeup latency.
-    if !filtered.starts_with(' ') {
-        filtered = format!(" {filtered}");
     }
 
     Ok(filtered)
@@ -302,34 +296,34 @@ mod tests {
 
         // Consonant-associated stress stripped on consonant 'f'
         let result_ph = phonemize("phonemizer", "en", &vocab).unwrap();
-        assert_eq!(result_ph, " fɑnɛmɪzɚ.");
+        assert_eq!(result_ph, "fɑnɛmɪzɚ.");
 
         // "now" -> nˈaʊ
         let result_now = phonemize("now", "en", &vocab).unwrap();
-        assert_eq!(result_now, " nˈaʊ");
+        assert_eq!(result_now, "nˈaʊ");
 
         // "hitting" -> hˈɪtɪŋ
         let result_hitting = phonemize("hitting", "en", &vocab).unwrap();
-        assert_eq!(result_hitting, " hˈɪtɪŋ");
+        assert_eq!(result_hitting, "hˈɪtɪŋ");
 
         // "automatically" -> ˌɔtəmˈætəkᵊli
         let result_auto = phonemize("automatically", "en", &vocab).unwrap();
-        assert_eq!(result_auto, " ˌɔtəmˈætəkᵊli");
+        assert_eq!(result_auto, "ˌɔtəmˈætəkᵊli");
 
         // "data" -> dˈeɪtə
         let result_data = phonemize("data", "en", &vocab).unwrap();
-        assert_eq!(result_data, " dˈeɪtə");
+        assert_eq!(result_data, "dˈeɪtə");
 
         // "Compatibility" -> kəmpˌætəbˈɪləti
         let result_compat = phonemize("Compatibility", "en", &vocab).unwrap();
-        assert_eq!(result_compat, " kəmpˌætəbˈɪləti");
+        assert_eq!(result_compat, "kəmpˌætəbˈɪləti");
 
         // "without" -> wɪðˈaʊt
         let result_without = phonemize("without", "en", &vocab).unwrap();
-        assert_eq!(result_without, " wɪðˈaʊt");
+        assert_eq!(result_without, "wɪðˈaʊt");
 
         // "walkthrough" -> wˈɔkθɹuː
         let result_walkthrough = phonemize("walkthrough", "en", &vocab).unwrap();
-        assert_eq!(result_walkthrough, " wˈɔkθɹuː");
+        assert_eq!(result_walkthrough, "wˈɔkθɹuː");
     }
 }
