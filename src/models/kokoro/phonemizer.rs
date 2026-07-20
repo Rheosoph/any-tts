@@ -66,8 +66,8 @@ fn filter_to_vocab(phonemes: &str, vocab: &HashMap<String, u32>) -> String {
     phonemes
         .chars()
         .filter(|c| {
-            let key = c.to_string();
-            vocab.contains_key(&key)
+            let mut buf = [0; 4];
+            vocab.contains_key(c.encode_utf8(&mut buf))
         })
         .collect()
 }
