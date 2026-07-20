@@ -76,14 +76,14 @@ cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
 accelerate = ["candle-core/accelerate", "candle-nn/accelerate", "candle-transformers/accelerate"]
 qwen3-tts = []
-kokoro = ["dep:kana2phone", "dep:lindera", "dep:pinyin"]
+kokoro = ["dep:kana2phone", "dep:lindera", "dep:pinyin", "dep:voice-g2p"]
 omnivoice = []
 vibevoice = []
 voxtral = []
 download = ["dep:reqwest"]
 
 [dependencies]
-voice-g2p = "0.2.2"
+voice-g2p = { version = "0.2.2", optional = true }
 base64 = "0.22"
 candle-core = "0.10.2"
 candle-nn = "0.10.2"
