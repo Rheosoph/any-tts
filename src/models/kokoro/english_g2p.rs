@@ -432,10 +432,24 @@ where
     'static: 'a,
 {
     if british {
-        lookup_word_list(word, ENGLISH_WORDS_GB).or_else(|| lookup_word_list(word, ENGLISH_WORDS))
+        lookup_word_list(word, ENGLISH_WORDS_GB)
     } else {
-        lookup_word_list(word, ENGLISH_WORDS_US).or_else(|| lookup_word_list(word, ENGLISH_WORDS))
+        lookup_word_list(word, ENGLISH_WORDS_US)
     }
+    .or_else(|| lookup_word_list(word, ENGLISH_WORDS_COMMON_OVERRIDES))
+    .or_else(|| lookup_word_list(word, ENGLISH_WORDS))
+}
+
+pub(crate) fn lookup_dialect_word<'a>(word: &str, british: bool) -> Option<&'a str>
+where
+    'static: 'a,
+{
+    if british {
+        lookup_word_list(word, ENGLISH_WORDS_GB)
+    } else {
+        lookup_word_list(word, ENGLISH_WORDS_US)
+    }
+    .or_else(|| lookup_word_list(word, ENGLISH_WORDS_COMMON_OVERRIDES))
 }
 
 fn lookup_word_list<'a>(word: &str, entries: &'a [(&'a str, &'a str)]) -> Option<&'a str> {
@@ -725,6 +739,11 @@ const ENGLISH_WORDS: &[(&str, &str)] = &[
     ("you", "juː"),
     ("zero", "ˈzɪɹoʊ"),
     ("nine", "naɪn"),
+];
+
+const ENGLISH_WORDS_COMMON_OVERRIDES: &[(&str, &str)] = &[
+    ("walkthrough", "wˈɔkθɹuː"),
+    ("walkthroughs", "wˈɔkθɹuːz"),
 ];
 
 const ENGLISH_WORDS_US: &[(&str, &str)] = &[("schedule", "ˈskɛʤuːl")];
