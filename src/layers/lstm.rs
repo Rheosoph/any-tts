@@ -21,16 +21,26 @@ pub struct Lstm {
 }
 
 struct LstmLayer {
-    weight_ih: Tensor,
-    weight_hh: Tensor,
-    bias_ih: Tensor,
-    bias_hh: Tensor,
-    // Reverse direction weights (only for bidirectional)
-    weight_ih_rev: Option<Tensor>,
-    weight_hh_rev: Option<Tensor>,
-    bias_ih_rev: Option<Tensor>,
-    bias_hh_rev: Option<Tensor>,
+    forward_weights: LstmWeights,
+    reverse_weights: Option<LstmWeights>,
     hidden_size: usize,
+}
+
+/// Inference weights in the layout consumed by matrix multiplication.
+struct LstmWeights {
+    weight_ih_t: Tensor,
+    weight_hh_t: Tensor,
+    bias: Tensor,
+}
+
+impl LstmWeights {
+    fn new(weight_ih: Tensor, weight_hh: Tensor, bias_ih: Tensor, bias_hh: Tensor) -> Result<Self> {
+        Ok(Self {
+            weight_ih_t: weight_ih.t()?.contiguous()?,
+            weight_hh_t: weight_hh.t()?.contiguous()?,
+            bias: (bias_ih + bias_hh)?,
+        })
+    }
 }
 
 impl Lstm {
@@ -68,7 +78,7 @@ impl Lstm {
             let bias_ih = vb.get(4 * hidden_size, &format!("bias_ih_l{}", layer_idx))?;
             let bias_hh = vb.get(4 * hidden_size, &format!("bias_hh_l{}", layer_idx))?;
 
-            let (weight_ih_rev, weight_hh_rev, bias_ih_rev, bias_hh_rev) = if bidirectional {
+            let reverse_weights = if bidirectional {
                 let w_ih = vb.get(
                     (4 * hidden_size, in_size),
                     &format!("weight_ih_l{}_reverse", layer_idx),
@@ -79,20 +89,14 @@ impl Lstm {
                 )?;
                 let b_ih = vb.get(4 * hidden_size, &format!("bias_ih_l{}_reverse", layer_idx))?;
                 let b_hh = vb.get(4 * hidden_size, &format!("bias_hh_l{}_reverse", layer_idx))?;
-                (Some(w_ih), Some(w_hh), Some(b_ih), Some(b_hh))
+                Some(LstmWeights::new(w_ih, w_hh, b_ih, b_hh)?)
             } else {
-                (None, None, None, None)
+                None
             };
 
             layers.push(LstmLayer {
-                weight_ih,
-                weight_hh,
-                bias_ih,
-                bias_hh,
-                weight_ih_rev,
-                weight_hh_rev,
-                bias_ih_rev,
-                bias_hh_rev,
+                forward_weights: LstmWeights::new(weight_ih, weight_hh, bias_ih, bias_hh)?,
+                reverse_weights,
                 hidden_size,
             });
         }
@@ -113,7 +117,7 @@ impl Lstm {
         let mut current = input.clone();
 
         for layer in &self.layers {
-            current = layer.forward(&current, self.bidirectional)?;
+            current = layer.forward(&current)?;
         }
 
         Ok(current)
@@ -126,25 +130,11 @@ impl Lstm {
 }
 
 impl LstmLayer {
-    fn forward(&self, input: &Tensor, bidirectional: bool) -> Result<Tensor> {
-        let fwd = self.forward_direction(
-            input,
-            &self.weight_ih,
-            &self.weight_hh,
-            &self.bias_ih,
-            &self.bias_hh,
-            false,
-        )?;
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        let fwd = self.forward_direction(input, &self.forward_weights, false)?;
 
-        if bidirectional {
-            let rev = self.forward_direction(
-                input,
-                self.weight_ih_rev.as_ref().unwrap(),
-                self.weight_hh_rev.as_ref().unwrap(),
-                self.bias_ih_rev.as_ref().unwrap(),
-                self.bias_hh_rev.as_ref().unwrap(),
-                true,
-            )?;
+        if let Some(weights) = &self.reverse_weights {
+            let rev = self.forward_direction(input, weights, true)?;
             Tensor::cat(&[&fwd, &rev], 2)
         } else {
             Ok(fwd)
@@ -154,36 +144,35 @@ impl LstmLayer {
     fn forward_direction(
         &self,
         input: &Tensor,
-        weight_ih: &Tensor,
-        weight_hh: &Tensor,
-        bias_ih: &Tensor,
-        bias_hh: &Tensor,
+        weights: &LstmWeights,
         reverse: bool,
     ) -> Result<Tensor> {
-        let (batch, seq_len, _) = input.dims3()?;
+        let (batch, seq_len, input_size) = input.dims3()?;
         let device = input.device();
         let dtype = input.dtype();
+
+        if seq_len == 0 {
+            return Tensor::zeros((batch, 0, self.hidden_size), dtype, device);
+        }
+
+        // Every input projection is independent of the recurrent state. One
+        // matrix multiplication handles all positions and batch elements.
+        let input_gates = input
+            .reshape((batch * seq_len, input_size))?
+            .matmul(&weights.weight_ih_t)?
+            .broadcast_add(&weights.bias)?
+            .reshape((batch, seq_len, 4 * self.hidden_size))?;
 
         let mut h = Tensor::zeros((batch, self.hidden_size), dtype, device)?;
         let mut c = Tensor::zeros((batch, self.hidden_size), dtype, device)?;
         let mut outputs = Vec::with_capacity(seq_len);
 
-        let range: Vec<usize> = if reverse {
-            (0..seq_len).rev().collect()
-        } else {
-            (0..seq_len).collect()
-        };
-
-        for &t in &range {
-            let x_t = input.narrow(1, t, 1)?.squeeze(1)?.contiguous()?;
-
-            // gates = x @ W_ih^T + b_ih + h @ W_hh^T + b_hh
-            let w_ih_t = weight_ih.t()?.contiguous()?;
-            let w_hh_t = weight_hh.t()?.contiguous()?;
-            let gates = x_t
-                .matmul(&w_ih_t)?
-                .broadcast_add(bias_ih)?
-                .add(&h.matmul(&w_hh_t)?.broadcast_add(bias_hh)?)?;
+        for step in 0..seq_len {
+            let t = if reverse { seq_len - 1 - step } else { step };
+            let gates = input_gates
+                .narrow(1, t, 1)?
+                .squeeze(1)?
+                .add(&h.matmul(&weights.weight_hh_t)?)?;
 
             // Split into 4 gates: input, forget, cell, output
             let gate_size = self.hidden_size;
@@ -211,6 +200,200 @@ impl LstmLayer {
 mod tests {
     use super::*;
     use candle_core::Device;
+    use std::collections::HashMap;
+
+    // Original per-timestep equations provide an independent reference for
+    // batching, bias folding, reverse order, and stacked bidirectional layers.
+    fn reference_direction(
+        input: &Tensor,
+        weights: &HashMap<String, Tensor>,
+        layer: usize,
+        reverse: bool,
+    ) -> Result<Tensor> {
+        let suffix = if reverse { "_reverse" } else { "" };
+        let weight = |kind: &str| &weights[&format!("{kind}_l{layer}{suffix}")];
+        let (batch, seq, _) = input.dims3()?;
+        let hidden = weight("weight_hh").dim(1)?;
+        let mut h = Tensor::zeros((batch, hidden), input.dtype(), input.device())?;
+        let mut c = h.clone();
+        let mut outputs = Vec::new();
+        for step in 0..seq {
+            let t = if reverse { seq - step - 1 } else { step };
+            let gates = input
+                .narrow(1, t, 1)?
+                .squeeze(1)?
+                .contiguous()?
+                .matmul(&weight("weight_ih").t()?.contiguous()?)?
+                .broadcast_add(weight("bias_ih"))?
+                .add(
+                    &h.matmul(&weight("weight_hh").t()?.contiguous()?)?
+                        .broadcast_add(weight("bias_hh"))?,
+                )?;
+            let i = candle_nn::ops::sigmoid(&gates.narrow(1, 0, hidden)?)?;
+            let f = candle_nn::ops::sigmoid(&gates.narrow(1, hidden, hidden)?)?;
+            let g = gates.narrow(1, 2 * hidden, hidden)?.tanh()?;
+            let o = candle_nn::ops::sigmoid(&gates.narrow(1, 3 * hidden, hidden)?)?;
+            c = (f.mul(&c)? + i.mul(&g)?)?;
+            h = o.mul(&c.tanh()?)?;
+            outputs.push(h.unsqueeze(1)?);
+        }
+        if reverse {
+            outputs.reverse();
+        }
+        Tensor::cat(&outputs, 1)
+    }
+
+    #[test]
+    fn test_prepacked_lstm_matches_timestep_reference() {
+        let device = Device::Cpu;
+        let hidden = 3;
+        for bidirectional in [false, true] {
+            let mut weights = HashMap::new();
+            for layer in 0..2 {
+                let input_size = if layer == 0 {
+                    4
+                } else {
+                    hidden * if bidirectional { 2 } else { 1 }
+                };
+                for suffix in if bidirectional {
+                    vec!["", "_reverse"]
+                } else {
+                    vec![""]
+                } {
+                    for (kind, width) in [("ih", input_size), ("hh", hidden)] {
+                        let values = (0..4 * hidden * width)
+                            .map(|i| ((i + layer * 3 + suffix.len()) as f32 * 0.37).sin() * 0.2)
+                            .collect::<Vec<_>>();
+                        weights.insert(
+                            format!("weight_{kind}_l{layer}{suffix}"),
+                            Tensor::from_vec(values, (4 * hidden, width), &device).unwrap(),
+                        );
+                        let values = (0..4 * hidden)
+                            .map(|i| (i as f32 * 0.13).cos() * 0.05)
+                            .collect::<Vec<_>>();
+                        weights.insert(
+                            format!("bias_{kind}_l{layer}{suffix}"),
+                            Tensor::new(values.as_slice(), &device).unwrap(),
+                        );
+                    }
+                }
+            }
+            let input = Tensor::new(
+                (0..40).map(|i| (i as f32 * 0.17).sin()).collect::<Vec<_>>(),
+                &device,
+            )
+            .unwrap()
+            .reshape((2, 4, 5))
+            .unwrap()
+            .transpose(1, 2)
+            .unwrap();
+            let model = Lstm::load(
+                2,
+                4,
+                hidden,
+                bidirectional,
+                VarBuilder::from_tensors(weights.clone(), input.dtype(), &device),
+            )
+            .unwrap();
+            let actual = model.forward(&input).unwrap();
+            let mut expected = input;
+            for layer in 0..2 {
+                let forward = reference_direction(&expected, &weights, layer, false).unwrap();
+                expected = if bidirectional {
+                    Tensor::cat(
+                        &[
+                            forward,
+                            reference_direction(&expected, &weights, layer, true).unwrap(),
+                        ],
+                        2,
+                    )
+                    .unwrap()
+                } else {
+                    forward
+                };
+            }
+            let error = actual
+                .sub(&expected)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            assert!(error < 1e-6, "LSTM parity error: {error}");
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn test_prepacked_lstm_metal_matches_cpu() {
+        let metal = match Device::new_metal(0) {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("Skipping Metal LSTM test: {error}");
+                return;
+            }
+        };
+        let mut weights = HashMap::new();
+        for suffix in ["", "_reverse"] {
+            for (kind, input) in [("ih", 6), ("hh", 4)] {
+                let values = (0..16 * input)
+                    .map(|i| (i as f32 * 0.19).sin() * 0.1)
+                    .collect::<Vec<_>>();
+                weights.insert(
+                    format!("weight_{kind}_l0{suffix}"),
+                    Tensor::from_vec(values, (16, input), &Device::Cpu).unwrap(),
+                );
+                weights.insert(
+                    format!("bias_{kind}_l0{suffix}"),
+                    Tensor::ones(16, candle_core::DType::F32, &Device::Cpu)
+                        .unwrap()
+                        .affine(0.03, 0.0)
+                        .unwrap(),
+                );
+            }
+        }
+        let input = Tensor::new(
+            (0..60).map(|i| (i as f32 * 0.17).cos()).collect::<Vec<_>>(),
+            &Device::Cpu,
+        )
+        .unwrap()
+        .reshape((2, 5, 6))
+        .unwrap();
+        let cpu = Lstm::load(
+            1,
+            6,
+            4,
+            true,
+            VarBuilder::from_tensors(weights.clone(), input.dtype(), &Device::Cpu),
+        )
+        .unwrap();
+        let gpu = Lstm::load(
+            1,
+            6,
+            4,
+            true,
+            VarBuilder::from_tensors(weights, input.dtype(), &metal),
+        )
+        .unwrap();
+        let expected = cpu.forward(&input).unwrap();
+        let actual = gpu
+            .forward(&input.to_device(&metal).unwrap())
+            .unwrap()
+            .to_device(&Device::Cpu)
+            .unwrap();
+        let error = actual
+            .sub(&expected)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(error < 1e-5, "CPU/Metal LSTM parity error: {error}");
+    }
 
     #[test]
     fn test_lstm_output_shape() {
@@ -227,14 +410,8 @@ mod tests {
         let bias_hh = Tensor::zeros(4 * hidden, dtype, &device).unwrap();
 
         let layer = LstmLayer {
-            weight_ih,
-            weight_hh,
-            bias_ih,
-            bias_hh,
-            weight_ih_rev: None,
-            weight_hh_rev: None,
-            bias_ih_rev: None,
-            bias_hh_rev: None,
+            forward_weights: LstmWeights::new(weight_ih, weight_hh, bias_ih, bias_hh).unwrap(),
+            reverse_weights: None,
             hidden_size: hidden,
         };
 

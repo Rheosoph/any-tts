@@ -8,6 +8,7 @@ use crate::tokenizer::TextTokenizer;
 
 use super::config::{VibeVoiceConfig, VibeVoicePreprocessorConfig};
 use super::diffusion::VibeVoiceDiffusionHead;
+use super::generation::valid_generated_tokens;
 use super::processor::{VibeVoiceProcessor, VibeVoiceTokenizerSpec};
 use super::runtime::{SpeechConnector, VibeVoiceLanguageModel};
 use super::speech_tokenizer::{VibeVoiceAcousticTokenizer, VibeVoiceSemanticTokenizer};
@@ -72,6 +73,7 @@ pub(super) fn load_components(
     model_config: &VibeVoiceConfig,
     device: &Device,
     dtype: DType,
+    tokenizer_spec: &VibeVoiceTokenizerSpec,
 ) -> Result<LoadedVibeVoiceComponents, TtsError> {
     let vb = ModelFiles::load_safetensors_vb(&files.weights, dtype, device)?;
     let model_vb = vb.pp("model");
@@ -80,6 +82,13 @@ pub(super) fn load_components(
         model_vb.pp("language_model"),
         device,
         dtype,
+        &valid_generated_tokens(
+            tokenizer_spec.speech_start_id,
+            tokenizer_spec.speech_end_id,
+            tokenizer_spec.speech_diffusion_id,
+            tokenizer_spec.eos_id,
+            tokenizer_spec.bos_id,
+        ),
     )?;
     let acoustic_tokenizer = VibeVoiceAcousticTokenizer::load(
         &model_config.acoustic_tokenizer_config,

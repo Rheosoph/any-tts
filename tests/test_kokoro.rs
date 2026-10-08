@@ -8,6 +8,10 @@ use any_tts::traits::TtsModel;
 use any_tts::{ModelType, SynthesisRequest, TtsConfig};
 
 #[test]
+#[cfg_attr(
+    feature = "download",
+    ignore = "Missing-path fallback can download weights; run without the download feature"
+)]
 fn test_kokoro_load_missing_path() {
     let config = TtsConfig::new(ModelType::Kokoro);
     let result = KokoroModel::load(config);

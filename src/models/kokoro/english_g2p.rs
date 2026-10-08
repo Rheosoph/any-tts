@@ -41,6 +41,45 @@ pub(crate) fn phonemize_clause(text: &str, british: bool) -> String {
     output
 }
 
+/// Deterministic dictionary-miss fallback. This is a word API: it never adds
+/// sentence punctuation and it returns Kokoro's model symbols, not expanded IPA.
+pub(crate) fn phonemize_word_for_model(word: &str, british: bool) -> String {
+    let ipa = phonemize_clause(word, british);
+    let encoded = ipa
+        .replace("eɪ", "A")
+        .replace("aɪ", "I")
+        .replace("oʊ", "O")
+        .replace("əʊ", "Q")
+        .replace("aʊ", "W")
+        .replace("ɔɪ", "Y")
+        .replace("tʃ", "ʧ")
+        .replace("dʒ", "ʤ")
+        .replace('ɚ', "əɹ")
+        .replace('g', "ɡ");
+    let encoded = if british {
+        encoded
+    } else {
+        encoded.replace('ː', "")
+    };
+    // Rules place stress before the onset. Move it to the next vowel, matching
+    // Misaki's convention, without deleting the stress information.
+    let mut output = String::with_capacity(encoded.len());
+    let mut pending = None;
+    for ch in encoded.chars() {
+        if matches!(ch, 'ˈ' | 'ˌ') {
+            pending = Some(ch);
+        } else {
+            if "AIOQWYaiuæɑɒɔəɛɜɪʊʌᵻɐ".contains(ch) {
+                if let Some(stress) = pending.take() {
+                    output.push(stress);
+                }
+            }
+            output.push(ch);
+        }
+    }
+    output
+}
+
 enum ClausePart {
     Token(String),
     Separator(char),
@@ -440,18 +479,6 @@ where
     .or_else(|| lookup_word_list(word, ENGLISH_WORDS))
 }
 
-pub(crate) fn lookup_dialect_word<'a>(word: &str, british: bool) -> Option<&'a str>
-where
-    'static: 'a,
-{
-    if british {
-        lookup_word_list(word, ENGLISH_WORDS_GB)
-    } else {
-        lookup_word_list(word, ENGLISH_WORDS_US)
-    }
-    .or_else(|| lookup_word_list(word, ENGLISH_WORDS_COMMON_OVERRIDES))
-}
-
 fn lookup_word_list<'a>(word: &str, entries: &'a [(&'a str, &'a str)]) -> Option<&'a str> {
     entries
         .iter()
@@ -741,10 +768,8 @@ const ENGLISH_WORDS: &[(&str, &str)] = &[
     ("nine", "naɪn"),
 ];
 
-const ENGLISH_WORDS_COMMON_OVERRIDES: &[(&str, &str)] = &[
-    ("walkthrough", "wˈɔkθɹuː"),
-    ("walkthroughs", "wˈɔkθɹuːz"),
-];
+const ENGLISH_WORDS_COMMON_OVERRIDES: &[(&str, &str)] =
+    &[("walkthrough", "wˈɔkθɹuː"), ("walkthroughs", "wˈɔkθɹuːz")];
 
 const ENGLISH_WORDS_US: &[(&str, &str)] = &[("schedule", "ˈskɛʤuːl")];
 

@@ -311,6 +311,19 @@ impl TtsModel for OmniVoiceModel {
     }
 
     fn synthesize(&self, request: &SynthesisRequest) -> Result<AudioSamples, TtsError> {
+        if request.speed.is_some() {
+            return Err(TtsError::ModelError(
+                "OmniVoice does not support explicit speaking speed".into(),
+            ));
+        }
+        if request.max_tokens == Some(0)
+            || request.temperature.is_some_and(|v| !v.is_finite())
+            || request.cfg_scale.is_some_and(|v| !v.is_finite())
+        {
+            return Err(TtsError::ConfigError(
+                "Generation limits must be positive and sampling parameters finite".into(),
+            ));
+        }
         if request.voice.is_some() {
             return Err(TtsError::ModelError(
                 "OmniVoice does not use named voices. Use `instruct` for voice design instead."
@@ -509,6 +522,7 @@ impl OmniVoiceModel {
         Ok(generated)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn generate_audio_tokens(
         &self,
         text: &str,
@@ -594,30 +608,40 @@ impl OmniVoiceModel {
                 )?
                 .to_dtype(DType::F32)?
                 .i((0..1, .., cond_len - target_len..cond_len, ..))?;
-            let uncond_input_ids_tensor = Tensor::new(
-                uncond_input_ids.as_slice(),
-                &self.compute_device,
-            )?
-            .reshape((1, self.config.num_audio_codebook, target_len))?;
-            let u_logits = self
-                .backbone
-                .lock()
-                .map_err(|_| {
-                    TtsError::RuntimeError("OmniVoice model mutex was poisoned".to_string())
-                })?
-                .forward(
-                    &uncond_input_ids_tensor,
-                    &uncond_audio_mask_u32,
-                    &uncond_audio_mask_f32,
-                    uncond_attention_mask.as_ref(),
-                )?
-                .to_dtype(DType::F32)?;
-            let (pred_tokens, scores) =
-                self.predict_tokens_with_scoring(&cond_logits, &u_logits, gen_config, &mut rng)?;
-            maybe_dump_debug_first_step(&cond_logits, &u_logits, &pred_tokens, &scores)?;
-
-            let pred_tokens_flat = pred_tokens.flatten_all()?.to_vec1::<u32>()?;
-            let mut scores_flat = scores.flatten_all()?.to_vec1::<f32>()?;
+            let u_logits =
+                if gen_config.guidance_scale != 0.0 {
+                    let uncond_input_ids_tensor =
+                        Tensor::new(uncond_input_ids.as_slice(), &self.compute_device)?
+                            .reshape((1, self.config.num_audio_codebook, target_len))?;
+                    let logits = self
+                        .backbone
+                        .lock()
+                        .map_err(|_| {
+                            TtsError::RuntimeError("OmniVoice model mutex was poisoned".to_string())
+                        })?
+                        .forward(
+                            &uncond_input_ids_tensor,
+                            &uncond_audio_mask_u32,
+                            &uncond_audio_mask_f32,
+                            uncond_attention_mask.as_ref(),
+                        )?
+                        .to_dtype(DType::F32)?;
+                    Some(logits)
+                } else {
+                    None
+                };
+            let (pred_tokens_flat, mut scores_flat) = self.predict_tokens_with_scoring(
+                &cond_logits,
+                u_logits.as_ref(),
+                gen_config,
+                &mut rng,
+            )?;
+            maybe_dump_debug_first_step(
+                &cond_logits,
+                u_logits.as_ref(),
+                &pred_tokens_flat,
+                &scores_flat,
+            )?;
             for (layer_scores, penalty) in scores_flat
                 .chunks_exact_mut(target_len)
                 .zip(layer_penalties.iter().copied())
@@ -685,6 +709,7 @@ impl OmniVoiceModel {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn prepare_inference_inputs(
         &self,
         text: &str,
@@ -760,19 +785,11 @@ impl OmniVoiceModel {
     fn predict_tokens_with_scoring(
         &self,
         c_logits: &Tensor,
-        u_logits: &Tensor,
+        u_logits: Option<&Tensor>,
         gen_config: &OmniVoiceGenerationConfig,
         rng: &mut SimpleRng,
-    ) -> Result<(Tensor, Tensor), TtsError> {
-        let mut log_probs = if gen_config.guidance_scale != 0.0 {
-            let c_log_probs = log_softmax_last_dim(c_logits)?;
-            let u_log_probs = log_softmax_last_dim(u_logits)?;
-            let guidance = c_log_probs.broadcast_sub(&u_log_probs)?;
-            let guided = c_log_probs.broadcast_add(&(guidance * gen_config.guidance_scale)?)?;
-            log_softmax_last_dim(&guided)?
-        } else {
-            log_softmax_last_dim(c_logits)?
-        };
+    ) -> Result<(Vec<u32>, Vec<f32>), TtsError> {
+        let mut log_probs = guided_log_probs(c_logits, u_logits, gen_config.guidance_scale)?;
 
         log_probs = log_probs.broadcast_add(&self.mask_token_penalty)?;
 
@@ -792,8 +809,7 @@ impl OmniVoiceModel {
                         .enumerate()
                         .map(|(token, score)| (score, token))
                         .collect();
-                    candidates.sort_by(|left, right| right.0.total_cmp(&left.0));
-                    candidates.truncate(top_k);
+                    retain_best(&mut candidates, top_k);
                     let mut best = (f32::NEG_INFINITY, 0usize);
                     for (score, token) in candidates.iter().copied() {
                         let noisy = score / gen_config.class_temperature + rng.next_gumbel();
@@ -806,17 +822,51 @@ impl OmniVoiceModel {
                 }
             }
 
-            let pred_tokens = Tensor::new(pred_tokens.as_slice(), &self.compute_device)?
-                .reshape((1, codebooks, seq_len))?;
-            let scores = Tensor::new(scores.as_slice(), &self.compute_device)?
-                .reshape((1, codebooks, seq_len))?;
             Ok((pred_tokens, scores))
         } else {
             let pred_tokens = log_probs.argmax(candle_core::D::Minus1)?;
             let scores = log_probs.max(candle_core::D::Minus1)?;
-            Ok((pred_tokens, scores))
+            Ok((
+                pred_tokens.flatten_all()?.to_vec1::<u32>()?,
+                scores.flatten_all()?.to_vec1::<f32>()?,
+            ))
         }
     }
+}
+
+fn guided_log_probs(
+    conditional: &Tensor,
+    unconditional: Option<&Tensor>,
+    scale: f64,
+) -> Result<Tensor, TtsError> {
+    let c = log_softmax_last_dim(conditional)?;
+    if scale == 0.0 {
+        return Ok(c);
+    }
+    let unconditional = unconditional.ok_or_else(|| {
+        TtsError::ModelError("OmniVoice guidance requires unconditional logits".into())
+    })?;
+    let u = log_softmax_last_dim(unconditional)?;
+    let guidance = c.broadcast_sub(&u)?;
+    log_softmax_last_dim(&c.broadcast_add(&(guidance * scale)?)?)
+}
+
+fn retain_best(candidates: &mut Vec<(f32, usize)>, count: usize) {
+    let compare = |left: &(f32, usize), right: &(f32, usize)| {
+        right
+            .0
+            .total_cmp(&left.0)
+            .then_with(|| left.1.cmp(&right.1))
+    };
+    if count == 0 {
+        candidates.clear();
+        return;
+    }
+    if candidates.len() > count {
+        candidates.select_nth_unstable_by(count - 1, compare);
+        candidates.truncate(count);
+    }
+    candidates.sort_unstable_by(compare);
 }
 
 fn build_schedule(total_masked: usize, num_steps: usize, t_shift: f64) -> Vec<usize> {
@@ -885,12 +935,7 @@ fn select_positions(
         }
         candidates.push((value, index));
     }
-    candidates.sort_by(|left, right| {
-        right
-            .0
-            .total_cmp(&left.0)
-            .then_with(|| left.1.cmp(&right.1))
-    });
+    retain_best(&mut candidates, count);
     candidates
         .into_iter()
         .take(count)
@@ -988,9 +1033,9 @@ fn maybe_dump_debug_tokens(
 
 fn maybe_dump_debug_first_step(
     cond_logits: &Tensor,
-    uncond_logits: &Tensor,
-    pred_tokens: &Tensor,
-    scores: &Tensor,
+    uncond_logits: Option<&Tensor>,
+    pred_tokens: &[u32],
+    scores: &[f32],
 ) -> Result<(), TtsError> {
     let Some(path) = std::env::var_os("OMNIVOICE_DEBUG_FIRST_STEP_DUMP") else {
         return Ok(());
@@ -1047,15 +1092,17 @@ fn maybe_dump_step_trace(step_trace: &[serde_json::Value]) -> Result<(), TtsErro
 
 fn build_first_step_debug_payload(
     cond_logits: &Tensor,
-    uncond_logits: &Tensor,
-    pred_tokens: &Tensor,
-    scores: &Tensor,
+    uncond_logits: Option<&Tensor>,
+    pred_tokens: &[u32],
+    scores: &[f32],
 ) -> Result<serde_json::Value, TtsError> {
     let (_batch, codebooks, seq_len, vocab_size) = cond_logits.dims4()?;
     let cond_flat = cond_logits.flatten_all()?.to_vec1::<f32>()?;
-    let uncond_flat = uncond_logits.flatten_all()?.to_vec1::<f32>()?;
-    let pred_tokens_flat = pred_tokens.flatten_all()?.to_vec1::<u32>()?;
-    let scores_flat = scores.flatten_all()?.to_vec1::<f32>()?;
+    let uncond_flat = uncond_logits
+        .map(|x| x.flatten_all()?.to_vec1::<f32>())
+        .transpose()?;
+    let pred_tokens_flat = pred_tokens;
+    let scores_flat = scores;
     let position_count = seq_len.min(4);
 
     let mut layers = Vec::with_capacity(codebooks);
@@ -1067,7 +1114,7 @@ fn build_first_step_debug_payload(
             positions.push(serde_json::json!({
                 "position": pos,
                 "cond_top": top_k_summary(&cond_flat[start..end], 10),
-                "uncond_top": top_k_summary(&uncond_flat[start..end], 10),
+                "uncond_top": uncond_flat.as_ref().map(|values| top_k_summary(&values[start..end], 10)),
                 "pred_token": pred_tokens_flat[index_2d(layer, pos, seq_len)],
                 "score": scores_flat[index_2d(layer, pos, seq_len)],
             }));
@@ -1468,9 +1515,34 @@ fn post_process_audio(samples: &mut Vec<f32>, sample_rate: u32) {
     *samples = padded;
 }
 
+fn index_2d(row: usize, col: usize, cols: usize) -> usize {
+    row * cols + col
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unguided_scoring_needs_no_unconditional_pass() -> Result<(), TtsError> {
+        let conditional = Tensor::new(&[1f32, 2., 3.], &Device::Cpu)?;
+        let actual = guided_log_probs(&conditional, None, 0.)?;
+        assert_eq!(
+            actual.to_vec1::<f32>()?,
+            log_softmax_last_dim(&conditional)?.to_vec1::<f32>()?
+        );
+        assert!(guided_log_probs(&conditional, None, 2.).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn partial_selection_preserves_sorted_top_values_and_ties() {
+        let mut candidates = vec![(2., 3), (5., 8), (5., 1), (0., 4), (3., 9)];
+        retain_best(&mut candidates, 3);
+        assert_eq!(candidates, vec![(5., 1), (5., 8), (3., 9)]);
+        retain_best(&mut candidates, 0);
+        assert!(candidates.is_empty());
+    }
 
     #[test]
     fn combine_text_matches_upstream_cleanup() {
@@ -1493,8 +1565,4 @@ mod tests {
         assert_eq!(merged.len(), 23);
         assert_eq!(&merged[10..13], &[0.0, 0.0, 0.0]);
     }
-}
-
-fn index_2d(row: usize, col: usize, cols: usize) -> usize {
-    row * cols + col
 }

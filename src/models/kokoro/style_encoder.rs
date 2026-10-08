@@ -332,19 +332,19 @@ impl StyleEncoder {
     /// Returns `[1, style_dim * 2]` — concatenation of `[acoustic, prosodic]`.
     pub fn encode(&self, audio: &ReferenceAudio, dtype: DType) -> TtsResult<Tensor> {
         // Resample if necessary
-        let samples = if audio.sample_rate != self.target_sample_rate {
+        if audio.sample_rate != self.target_sample_rate {
             info!(
                 "Resampling reference audio from {} Hz to {} Hz",
                 audio.sample_rate, self.target_sample_rate
             );
-            crate::mel::resample_linear(&audio.samples, audio.sample_rate, self.target_sample_rate)
-        } else {
-            audio.samples.clone()
-        };
+        }
+        let samples =
+            crate::mel::resample_audio(&audio.samples, audio.sample_rate, self.target_sample_rate)?;
 
-        let device = self.mel.config().n_fft; // just to get device from mel
-        let _ = device;
-        let audio_tensor = Tensor::new(samples.as_slice(), &Device::Cpu)?;
+        // The extractor runs its FFT on CPU and returns mel features on the
+        // configured model device, including for Metal and CUDA encoders.
+        let length = samples.len();
+        let audio_tensor = Tensor::from_vec(samples, length, &Device::Cpu)?;
 
         // Compute mel spectrogram: [1, n_mels, time]
         let mel_spec = self.mel.compute(&audio_tensor)?;

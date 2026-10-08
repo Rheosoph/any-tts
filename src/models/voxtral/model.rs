@@ -11,6 +11,7 @@ use crate::audio::AudioSamples;
 use crate::config::{DType as ConfigDType, ModelAsset, ModelAssetDir, ModelFiles, TtsConfig};
 use crate::error::TtsError;
 use crate::layers::conv::apply_weight_norm;
+use crate::layers::kv_cache::KvCache;
 use crate::tensor_utils::{
     apply_rotary_emb, cpu_flash_attention, precompute_rope_freqs, silu, RmsNorm,
 };
@@ -138,6 +139,11 @@ impl TtsModel for VoxtralModel {
     }
 
     fn synthesize(&self, request: &SynthesisRequest) -> Result<AudioSamples, TtsError> {
+        if request.speed.is_some() {
+            return Err(TtsError::ModelError(
+                "Voxtral does not support explicit speaking speed".into(),
+            ));
+        }
         let debug_frames = std::env::var_os("VOXTRAL_DEBUG_FRAMES").is_some();
 
         if request.reference_audio.is_some() {
@@ -343,7 +349,7 @@ struct MistralAttention {
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
-    kv_cache: Option<(Tensor, Tensor)>,
+    kv_cache: KvCache,
 }
 
 impl MistralAttention {
@@ -364,7 +370,7 @@ impl MistralAttention {
             num_heads: config.n_heads,
             num_kv_heads: config.n_kv_heads,
             head_dim: config.head_dim,
-            kv_cache: None,
+            kv_cache: KvCache::new(),
         })
     }
 
@@ -404,48 +410,35 @@ impl MistralAttention {
             .unsqueeze(0)?;
         let (q, k) = apply_rotary_emb(&q, &k, &cos, &sin)?;
 
-        let (k, v) = if let Some((cached_k, cached_v)) = &self.kv_cache {
-            (
-                Tensor::cat(&[cached_k, &k], 2)?,
-                Tensor::cat(&[cached_v, &v], 2)?,
-            )
-        } else {
-            (k, v)
-        };
-        self.kv_cache = Some((k.clone(), v.clone()));
+        let (k, v) = self.kv_cache.append(&k, &v)?;
 
         let scale = 1.0f32 / (self.head_dim as f32).sqrt();
-        let attn_output = if let Some(cpu_attn_output) =
-            cpu_flash_attention(&q, &k, &v, mask, scale)?
-        {
-            cpu_attn_output
-        } else if seq_len == 1
-            && mask.is_none()
-            && matches!(x.device(), Device::Metal(_))
-        {
-            candle_nn::ops::sdpa(
-                &q.contiguous()?,
-                &k.contiguous()?,
-                &v.contiguous()?,
-                None,
-                false,
-                scale,
-                1.0,
-            )?
-        } else {
-            let k = repeat_kv_heads(&k, self.num_heads / self.num_kv_heads)?;
-            let v = repeat_kv_heads(&v, self.num_heads / self.num_kv_heads)?;
-
-            let k_t = k.transpose(2, 3)?.contiguous()?;
-            let attn_scores = q.matmul(&k_t)?.affine(scale as f64, 0.0)?;
-            let attn_scores = if let Some(mask) = mask {
-                attn_scores.broadcast_add(mask)?
+        let attn_output =
+            if let Some(cpu_attn_output) = cpu_flash_attention(&q, &k, &v, mask, scale)? {
+                cpu_attn_output
+            } else if seq_len == 1 && mask.is_none() && matches!(x.device(), Device::Metal(_)) {
+                candle_nn::ops::sdpa(&q.contiguous()?, &k, &v, None, false, scale, 1.0)?
             } else {
-                attn_scores
+                let k = repeat_kv_heads(&k, self.num_heads / self.num_kv_heads)?;
+                let v = repeat_kv_heads(&v, self.num_heads / self.num_kv_heads)?;
+                // The fused CPU path accepts cache strides; dense CPU GEMM
+                // requires packed values for multi-batch and Accelerate use.
+                let v = if x.device().is_cpu() {
+                    v.contiguous()?
+                } else {
+                    v
+                };
+
+                let k_t = k.transpose(2, 3)?.contiguous()?;
+                let attn_scores = q.matmul(&k_t)?.affine(scale as f64, 0.0)?;
+                let attn_scores = if let Some(mask) = mask {
+                    attn_scores.broadcast_add(mask)?
+                } else {
+                    attn_scores
+                };
+                let attn_probs = candle_nn::ops::softmax_last_dim(&attn_scores)?;
+                attn_probs.matmul(&v)?
             };
-            let attn_probs = candle_nn::ops::softmax_last_dim(&attn_scores)?;
-            attn_probs.matmul(&v)?
-        };
         let attn_output = attn_output.transpose(1, 2)?.reshape((
             batch_size,
             seq_len,
@@ -455,7 +448,7 @@ impl MistralAttention {
     }
 
     fn clear_cache(&mut self) {
-        self.kv_cache = None;
+        self.kv_cache.clear();
     }
 }
 

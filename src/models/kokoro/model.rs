@@ -5,7 +5,7 @@
 //!
 //! ## Inference pipeline
 //!
-//! 1. Plain text → espeak-ng phonemization → Kokoro IPA post-processing
+//! 1. Plain text → in-process sentence G2P → Kokoro phoneme tokens
 //! 2. IPA phoneme chars → char-level token IDs via vocab
 //! 3. ALBERT (PL-BERT) encodes phonemes → `bert_encoder` projects to hidden dim
 //! 4. ProsodyPredictor predicts duration, F0, and noise from encoded features + style
@@ -48,6 +48,100 @@ const _FULL_STYLE_DIM: usize = STYLE_DIM * 2;
 const _MAX_VOICE_POSITIONS: usize = 512;
 /// Maximum offset index for voice selection.
 const MAX_VOICE_OFFSET: usize = 509;
+
+#[derive(Debug)]
+struct PhonemeChunk {
+    ids: Vec<u32>,
+    pause_after_ms: u32,
+}
+
+fn validated_speed(speed: Option<f64>) -> TtsResult<f64> {
+    let speed = speed.unwrap_or(1.0);
+    if !speed.is_finite() || !(0.1..=5.0).contains(&speed) {
+        return Err(TtsError::ConfigError(
+            "Kokoro speed must be finite and between 0.1 and 5.0".into(),
+        ));
+    }
+    Ok(speed)
+}
+
+/// Split only when necessary, retaining every valid phoneme token. Prefer
+/// sentence ends, then clause ends, then word boundaries, with a hard split
+/// reserved for a single word longer than the context window.
+fn chunk_phonemes(
+    phonemes: &str,
+    vocab: &HashMap<String, u32>,
+    max_tokens: usize,
+) -> TtsResult<Vec<PhonemeChunk>> {
+    if max_tokens == 0 {
+        return Err(TtsError::ConfigError(
+            "Kokoro context window is empty".into(),
+        ));
+    }
+    let mut tokens: Vec<(u32, u8)> = Vec::new();
+    let mut previous_boundary = 0;
+    for ch in phonemes.chars() {
+        let boundary = match ch {
+            '.' | '!' | '?' | '。' | '！' | '？' | '\n' => 3,
+            ',' | ';' | ':' | '，' | '；' | '：' => 2,
+            ch if ch.is_whitespace() => previous_boundary.max(1),
+            _ => 0,
+        };
+        let mut utf8 = [0u8; 4];
+        if let Some(&id) = vocab.get(ch.encode_utf8(&mut utf8) as &str) {
+            tokens.push((id, boundary));
+        } else if boundary > 0 {
+            if let Some((_, previous)) = tokens.last_mut() {
+                *previous = (*previous).max(boundary);
+            }
+        }
+        previous_boundary = boundary;
+    }
+    if tokens.is_empty() {
+        return Err(TtsError::TokenizerError(
+            "No valid phoneme tokens found in input".into(),
+        ));
+    }
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < tokens.len() {
+        let limit = start.saturating_add(max_tokens).min(tokens.len());
+        let (end, boundary) = if limit == tokens.len() {
+            (limit, 0)
+        } else {
+            let preferred = (1..=3).rev().find_map(|rank| {
+                tokens[start..limit]
+                    .iter()
+                    .rposition(|(_, boundary)| *boundary == rank)
+                    .map(|offset| (start + offset + 1, rank))
+            });
+            preferred.unwrap_or((limit, 0))
+        };
+        chunks.push(PhonemeChunk {
+            ids: tokens[start..end].iter().map(|(id, _)| *id).collect(),
+            pause_after_ms: match boundary {
+                3 => 200,
+                2 => 100,
+                _ => 0,
+            },
+        });
+        start = end;
+    }
+    Ok(chunks)
+}
+
+/// Top up an existing quiet tail instead of adding another full pause after
+/// punctuation that the duration predictor has already rendered as silence.
+fn ensure_boundary_pause(samples: &mut Vec<f32>, sample_rate: u32, millis: u32, speed: f64) {
+    let target = (sample_rate as f64 * millis as f64 / (1000.0 * speed)).round() as usize;
+    let existing = samples
+        .iter()
+        .rev()
+        .take(target)
+        .take_while(|sample| sample.abs() < 0.003)
+        .count();
+    samples.resize(samples.len() + target.saturating_sub(existing), 0.0);
+}
 
 /// Kokoro-82M TTS model.
 pub struct KokoroModel {
@@ -199,57 +293,83 @@ impl TtsModel for KokoroModel {
     }
 
     fn synthesize(&self, request: &SynthesisRequest) -> Result<AudioSamples, TtsError> {
-        // Determine language: explicit > inferred from voice name > default "en"
+        let mut samples = Vec::new();
+        self.synthesize_stream(request, &mut |chunk| {
+            samples.extend(chunk.samples);
+            Ok(())
+        })?;
+        Ok(AudioSamples::new(samples, self.sample_rate()))
+    }
+
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    fn synthesize_stream(
+        &self,
+        request: &SynthesisRequest,
+        on_chunk: &mut dyn FnMut(AudioSamples) -> Result<(), TtsError>,
+    ) -> Result<(), TtsError> {
+        let speed = validated_speed(request.speed)?;
         let voice_name = request.voice.as_deref().unwrap_or("af_heart");
         let language = request
             .language
             .as_deref()
             .unwrap_or_else(|| phonemizer::language_from_voice(voice_name));
-
-        // Convert plain text → IPA phonemes → token IDs
         let phonemes = phonemizer::phonemize(&request.text, language, &self.config.vocab)?;
-        let token_ids = self.text_to_ids(&phonemes)?;
-        if token_ids.is_empty() {
-            return Err(TtsError::TokenizerError(
-                "No valid phoneme tokens found in input".into(),
-            ));
-        }
+        let max_tokens = self
+            .config
+            .plbert
+            .max_position_embeddings
+            .checked_sub(2)
+            .filter(|limit| *limit > 0)
+            .ok_or_else(|| {
+                TtsError::ConfigError("Kokoro needs at least three context positions".into())
+            })?;
+        let chunks = chunk_phonemes(&phonemes, &self.config.vocab, max_tokens)?;
 
-        // Pad with boundary tokens: [0, ...ids..., 0]
-        let mut padded_ids = Vec::with_capacity(token_ids.len() + 2);
-        padded_ids.push(0u32); // Start boundary
-        padded_ids.extend_from_slice(&token_ids);
-        padded_ids.push(0u32); // End boundary
-        let seq_len = padded_ids.len();
+        // Reference conditioning is independent of chunk length: extract once.
+        // Named voice packs select their length-dependent row for each chunk.
+        let fixed_style = if let Some(embedding) = &request.voice_embedding {
+            Some(self.voice_embedding_to_tensor(embedding, 0)?)
+        } else if let Some(reference) = &request.reference_audio {
+            Some(self.voice_from_reference(reference)?)
+        } else {
+            None
+        };
 
         if std::env::var_os("KOKORO_DEBUG_INPUTS").is_some() {
             eprintln!("[kokoro] language={language} voice={voice_name}");
             eprintln!("[kokoro] phonemes={phonemes}");
-            eprintln!("[kokoro] input_ids={padded_ids:?}");
         }
 
-        // Resolve voice embedding — priority: voice_embedding > reference_audio > named voice
-        let ref_s = if let Some(ref embedding) = request.voice_embedding {
-            self.voice_embedding_to_tensor(embedding, seq_len)?
-        } else if let Some(ref reference) = request.reference_audio {
-            self.voice_from_reference(reference)?
-        } else {
-            self.load_voice_embedding(voice_name, seq_len)?
-        };
-
-        // Speed factor
-        let speed = request.temperature.unwrap_or(1.0).clamp(0.1, 5.0);
-
-        // Run inference
-        let audio_tensor = self.forward_with_tokens(&padded_ids, &ref_s, speed)?;
-
-        // Extract audio samples
-        let audio_data: Vec<f32> = audio_tensor
-            .flatten_all()?
-            .to_dtype(DType::F32)?
-            .to_vec1()?;
-
-        Ok(AudioSamples::new(audio_data, self.sample_rate()))
+        for chunk in chunks {
+            let mut padded_ids = Vec::with_capacity(chunk.ids.len() + 2);
+            padded_ids.push(0u32);
+            padded_ids.extend_from_slice(&chunk.ids);
+            padded_ids.push(0u32);
+            let ref_s = match &fixed_style {
+                Some(style) => style.clone(),
+                None => self.load_voice_embedding(voice_name, padded_ids.len())?,
+            };
+            if std::env::var_os("KOKORO_DEBUG_INPUTS").is_some() {
+                eprintln!("[kokoro] input_ids={padded_ids:?}");
+            }
+            let audio_tensor = self.forward_with_tokens(&padded_ids, &ref_s, speed)?;
+            let mut samples: Vec<f32> = audio_tensor
+                .flatten_all()?
+                .to_dtype(DType::F32)?
+                .to_vec1()?;
+            ensure_boundary_pause(
+                &mut samples,
+                self.sample_rate(),
+                chunk.pause_after_ms,
+                speed,
+            );
+            // Callback errors cancel generation before the next model forward.
+            on_chunk(AudioSamples::new(samples, self.sample_rate()))?;
+        }
+        Ok(())
     }
 
     fn sample_rate(&self) -> u32 {
@@ -350,24 +470,6 @@ impl KokoroModel {
                 "Unsupported weight format: .{other}. Expected .safetensors or .pth"
             ))),
         }
-    }
-
-    /// Convert IPA phoneme text to token IDs using the vocab map.
-    ///
-    /// Each character in the input string is looked up in the phoneme vocab.
-    /// Unknown characters are silently skipped.
-    fn text_to_ids(&self, text: &str) -> TtsResult<Vec<u32>> {
-        let mut ids = Vec::with_capacity(text.len());
-
-        for ch in text.chars() {
-            let key = ch.to_string();
-            if let Some(&id) = self.config.vocab.get(&key) {
-                ids.push(id);
-            }
-            // Silently skip unknown characters
-        }
-
-        Ok(ids)
     }
 
     /// Load a voice embedding tensor from a `.pt` file.
@@ -593,12 +695,8 @@ impl KokoroModel {
         // For single-sequence inference, all positions are valid → mask is all False
         let text_mask = Tensor::zeros((1, seq_len), DType::U8, &self.device)?;
 
-        // Create attention mask for ALBERT: 1 for valid, 0 for padded
-        let attention_mask =
-            Tensor::ones((1, seq_len), DType::F32, &self.device)?.to_dtype(self.dtype)?;
-
         // Step 1: ALBERT (PL-BERT) encoding
-        let bert_out = self.bert.forward(&ids_tensor, &attention_mask)?;
+        let bert_out = self.bert.forward_unmasked(&ids_tensor)?;
         // [1, seq_len, plbert_hidden_size]
 
         // Step 2: Project to hidden dim and transpose
@@ -638,28 +736,16 @@ impl KokoroModel {
         }
 
         // Step 5: Duration alignment
-        let aligned_len: usize = pred_dur.iter().sum();
-        if aligned_len == 0 {
+        if pred_dur.iter().all(|duration| *duration == 0) {
             return Err(TtsError::ModelError(
                 "All predicted durations are zero".into(),
             ));
         }
 
-        let pred_aln_trg = Self::build_alignment_matrix(
-            &pred_dur,
-            seq_len,
-            aligned_len,
-            &self.device,
-            self.dtype,
-        )?;
-        // [1, seq_len, aligned_len]
+        let alignment_indices = Self::build_alignment_indices(&pred_dur, &self.device)?;
 
-        // Step 6: Expand encoded features
-        // d: [1, seq_len, hidden_dim] → transpose to [1, hidden_dim, seq_len]
-        let d_t = d.transpose(1, 2)?.contiguous()?;
-        let pred_aln_trg = pred_aln_trg.contiguous()?;
-        let en = d_t.matmul(&pred_aln_trg)?;
-        // [1, hidden_dim, aligned_len]
+        // Expand features by gathering the token for each duration frame.
+        let en = Self::expand_by_alignment(&d.transpose(1, 2)?, &alignment_indices)?;
 
         // Step 7: Predict F0 and noise
         let (f0_pred, n_pred) = self.predictor.f0_n_predict(&en, &s_pred)?;
@@ -673,8 +759,7 @@ impl KokoroModel {
         // [1, hidden_dim, seq_len]
 
         // Step 9: Align text encoder output
-        let t_en = t_en.contiguous()?;
-        let asr = t_en.matmul(&pred_aln_trg)?;
+        let asr = Self::expand_by_alignment(&t_en, &alignment_indices)?;
         // [1, hidden_dim, aligned_len]
 
         // Step 10: Decode to audio
@@ -694,39 +779,40 @@ impl KokoroModel {
             .to_vec1()
             .map_err(TtsError::ComputeError)?;
 
+        if dur_f32.iter().any(|d| !d.is_finite()) {
+            return Err(TtsError::ModelError(
+                "Kokoro predicted a non-finite duration".into(),
+            ));
+        }
         Ok(dur_f32
             .iter()
             .map(|&d| (d + DURATION_ROUND_EPSILON).round().max(1.0) as usize)
             .collect())
     }
 
-    /// Build duration alignment matrix.
-    ///
-    /// Creates a [1, seq_len, aligned_len] tensor where each row i has 1s
-    /// in the columns corresponding to phoneme i's duration span.
-    fn build_alignment_matrix(
-        pred_dur: &[usize],
-        seq_len: usize,
-        aligned_len: usize,
-        device: &Device,
-        dtype: DType,
-    ) -> TtsResult<Tensor> {
-        let mut aln_data = vec![0f32; seq_len * aligned_len];
-        let mut col = 0;
-        for (i, &dur) in pred_dur.iter().enumerate() {
-            for j in 0..dur {
-                if col + j < aligned_len {
-                    aln_data[i * aligned_len + col + j] = 1.0;
-                }
-            }
-            col += dur;
+    /// Token index for every output duration frame; avoids a dense one-hot matrix.
+    fn build_alignment_indices(pred_dur: &[usize], device: &Device) -> TtsResult<Tensor> {
+        let aligned_len = pred_dur
+            .iter()
+            .try_fold(0usize, |sum, &duration| sum.checked_add(duration))
+            .ok_or_else(|| TtsError::ModelError("Duration alignment length overflow".into()))?;
+        let mut indices = Vec::new();
+        indices.try_reserve_exact(aligned_len).map_err(|e| {
+            TtsError::ModelError(format!("Cannot allocate duration alignment: {e}"))
+        })?;
+        for (index, &duration) in pred_dur.iter().enumerate() {
+            let index = u32::try_from(index)
+                .map_err(|_| TtsError::ModelError("Too many duration tokens".into()))?;
+            indices.extend(std::iter::repeat_n(index, duration));
         }
+        Tensor::from_vec(indices, aligned_len, device).map_err(TtsError::from)
+    }
 
-        let aln = Tensor::new(aln_data.as_slice(), device)?
-            .reshape((1, seq_len, aligned_len))?
-            .to_dtype(dtype)?;
-
-        Ok(aln)
+    fn expand_by_alignment(features: &Tensor, indices: &Tensor) -> TtsResult<Tensor> {
+        features
+            .contiguous()?
+            .index_select(indices, 2)
+            .map_err(TtsError::from)
     }
 
     /// Discover available voice names from the voices directory.
@@ -981,30 +1067,120 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_build_alignment_matrix() {
-        let pred_dur = vec![2, 3, 1];
-        let seq_len = 3;
-        let aligned_len = 6;
-        let device = Device::Cpu;
-
-        let aln = KokoroModel::build_alignment_matrix(
-            &pred_dur,
-            seq_len,
-            aligned_len,
-            &device,
-            DType::F32,
+    fn test_gather_alignment_matches_dense_reference() {
+        let durations = [2, 0, 3, 1];
+        let indices = KokoroModel::build_alignment_indices(&durations, &Device::Cpu).unwrap();
+        assert_eq!(indices.to_vec1::<u32>().unwrap(), vec![0, 0, 2, 2, 2, 3]);
+        let features = Tensor::new(
+            (0..24).map(|i| i as f32 * 0.13).collect::<Vec<_>>(),
+            &Device::Cpu,
         )
+        .unwrap()
+        .reshape((2, 4, 3))
+        .unwrap()
+        .transpose(1, 2)
         .unwrap();
+        let dense = Tensor::new(
+            &[
+                [1.0f32, 1.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 1.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            ],
+            &Device::Cpu,
+        )
+        .unwrap()
+        .unsqueeze(0)
+        .unwrap()
+        .broadcast_as((2, 4, 6))
+        .unwrap()
+        .contiguous()
+        .unwrap();
+        let expected = features.contiguous().unwrap().matmul(&dense).unwrap();
+        let actual = KokoroModel::expand_by_alignment(&features, &indices).unwrap();
+        assert_eq!(
+            actual.to_vec3::<f32>().unwrap(),
+            expected.to_vec3::<f32>().unwrap()
+        );
+    }
 
-        assert_eq!(aln.dims(), &[1, 3, 6]);
+    fn test_vocab(text: &str) -> HashMap<String, u32> {
+        text.chars()
+            .enumerate()
+            .map(|(i, ch)| (ch.to_string(), (i + 1) as u32))
+            .collect()
+    }
 
-        let data: Vec<Vec<f32>> = aln.squeeze(0).unwrap().to_vec2().unwrap();
-        // Row 0: dur=2 → cols 0,1
-        assert_eq!(data[0], vec![1.0, 1.0, 0.0, 0.0, 0.0, 0.0]);
-        // Row 1: dur=3 → cols 2,3,4
-        assert_eq!(data[1], vec![0.0, 0.0, 1.0, 1.0, 1.0, 0.0]);
-        // Row 2: dur=1 → col 5
-        assert_eq!(data[2], vec![0.0, 0.0, 0.0, 0.0, 0.0, 1.0]);
+    #[test]
+    fn test_phoneme_chunk_limits_and_unicode() {
+        let vocab = test_vocab("aʃ .?,;");
+        for count in [1, 510, 511, 2048] {
+            let text = "ʃ".repeat(count);
+            let chunks = chunk_phonemes(&text, &vocab, 510).unwrap();
+            assert!(chunks
+                .iter()
+                .all(|chunk| !chunk.ids.is_empty() && chunk.ids.len() <= 510));
+            assert_eq!(
+                chunks.iter().map(|chunk| chunk.ids.len()).sum::<usize>(),
+                count
+            );
+            assert_eq!(chunks.len(), count.div_ceil(510));
+        }
+        assert!(chunk_phonemes("", &vocab, 510).is_err());
+        assert!(chunk_phonemes("aaa", &vocab, 0).is_err());
+    }
+
+    #[test]
+    fn test_phoneme_chunks_prefer_sentence_then_words() {
+        let text = "aa. aaa aaa";
+        let vocab = test_vocab("a .");
+        let chunks = chunk_phonemes(text, &vocab, 8).unwrap();
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| chunk.ids.len())
+                .collect::<Vec<_>>(),
+            vec![4, 7]
+        );
+        assert_eq!(chunks[0].pause_after_ms, 200);
+        assert_eq!(chunks[1].pause_after_ms, 0);
+        let flat = chunks
+            .into_iter()
+            .flat_map(|chunk| chunk.ids)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            flat,
+            text.chars()
+                .map(|ch| vocab[&ch.to_string()])
+                .collect::<Vec<_>>()
+        );
+        let chunks = chunk_phonemes("aaa aaa aaa", &vocab, 7).unwrap();
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| chunk.ids.len())
+                .collect::<Vec<_>>(),
+            vec![4, 7]
+        );
+        assert_eq!(chunks[0].pause_after_ms, 0);
+    }
+
+    #[test]
+    fn test_boundary_pause_tops_up_existing_silence() {
+        let mut samples = vec![0.2, 0.0, 0.0];
+        ensure_boundary_pause(&mut samples, 1000, 5, 1.0);
+        assert_eq!(samples.len(), 6);
+        ensure_boundary_pause(&mut samples, 1000, 5, 1.0);
+        assert_eq!(samples.len(), 6);
+    }
+
+    #[test]
+    fn test_speed_validation() {
+        assert_eq!(validated_speed(None).unwrap(), 1.0);
+        for speed in [0.0, -1.0, 5.01, f64::NAN, f64::INFINITY] {
+            assert!(validated_speed(Some(speed)).is_err());
+        }
+        assert_eq!(validated_speed(Some(1.5)).unwrap(), 1.5);
     }
 
     #[test]

@@ -123,7 +123,7 @@ impl RealtimeLanguageModel {
         }
 
         for (layer, cache_entry) in self.layers.iter_mut().zip(cache_state.iter()) {
-            layer.set_cache_state(cache_entry.clone());
+            layer.restore_cache(cache_entry.clone());
         }
         Ok(())
     }
@@ -159,7 +159,7 @@ impl RealtimeLanguageModel {
             last_hidden,
             self.layers
                 .iter()
-                .map(TransformerBlock::cache_state)
+                .map(TransformerBlock::snapshot_cache)
                 .collect(),
         ))
     }

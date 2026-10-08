@@ -38,6 +38,9 @@ pub struct SynthesisRequest {
     pub max_tokens: Option<usize>,
     /// Sampling temperature. If `None`, use model default.
     pub temperature: Option<f64>,
+    /// Speaking-rate multiplier for backends that support it (currently Kokoro).
+    /// `1.0` is the normal rate; this is independent of sampling temperature.
+    pub speed: Option<f64>,
     /// Guidance scale for backends that support classifier-free guidance.
     pub cfg_scale: Option<f64>,
     /// Reference audio for zero-shot voice cloning.
@@ -63,6 +66,7 @@ impl SynthesisRequest {
             instruct: None,
             max_tokens: None,
             temperature: None,
+            speed: None,
             cfg_scale: None,
             reference_audio: None,
             voice_embedding: None,
@@ -96,6 +100,12 @@ impl SynthesisRequest {
     /// Set the sampling temperature.
     pub fn with_temperature(mut self, temperature: f64) -> Self {
         self.temperature = Some(temperature);
+        self
+    }
+
+    /// Set the speaking-rate multiplier (currently supported by Kokoro).
+    pub fn with_speed(mut self, speed: f64) -> Self {
+        self.speed = Some(speed);
         self
     }
 
@@ -141,6 +151,26 @@ pub trait TtsModel: Send + Sync {
     ///
     /// Returns raw f32 PCM audio samples at the model's native sample rate.
     fn synthesize(&self, request: &SynthesisRequest) -> Result<AudioSamples, TtsError>;
+
+    /// Deliver consecutive audio chunks in playback order.
+    ///
+    /// The callback runs synchronously and provides backpressure. Returning an
+    /// error cancels generation immediately; chunks already delivered remain
+    /// valid. Chunks use the model's native sample rate and contain no repeated
+    /// overlap. Implementations without incremental synthesis deliver one
+    /// complete chunk. Query [`Self::supports_streaming`] to distinguish them.
+    fn synthesize_stream(
+        &self,
+        request: &SynthesisRequest,
+        on_chunk: &mut dyn FnMut(AudioSamples) -> Result<(), TtsError>,
+    ) -> Result<(), TtsError> {
+        on_chunk(self.synthesize(request)?)
+    }
+
+    /// Whether this backend can deliver audio before the full request finishes.
+    fn supports_streaming(&self) -> bool {
+        false
+    }
 
     /// Return the native output sample rate in Hz (e.g. 24000).
     fn sample_rate(&self) -> u32;

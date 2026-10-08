@@ -11,10 +11,12 @@ pub mod config;
 pub mod decoder;
 mod english_g2p;
 pub mod espeak_compat;
+mod g2p;
 pub mod model;
 pub mod phonemizer;
 pub mod prosody;
 pub mod style_encoder;
 pub mod text_encoder;
+mod text_normalization;
 
 pub use model::KokoroModel;

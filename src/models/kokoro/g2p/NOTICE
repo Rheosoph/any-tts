@@ -1,0 +1,14 @@
+English G2P sources are adapted from voice-g2p 0.2.2 (MIT):
+https://github.com/rgbkrk/voicers/tree/ddaa835a60defc534d62a619647b72f79742e977/crates/voice-g2p
+Copyright (c) 2026 Kyle Kelley. License: LICENSE-MIT.
+US lexicons and perceptron tagger data are copied from that crates.io release.
+
+British lexicons are copied without modification from Misaki (Apache-2.0):
+https://github.com/hexgrad/misaki/tree/fba1236595f2d2bf21d414ba6e57d25256afada3/misaki/data
+Files: gb_gold.json, gb_silver.json. License: LICENSE-APACHE.
+Misaki is Copyright 2025 hexgrad. The voice-g2p implementation is itself
+based on Misaki's English frontend and dictionary representation.
+
+Local changes: module integration, removal of external espeak subprocesses,
+bounded deterministic Rust fallback cache, British lexicons and suffix rules,
+and preservation of sentence context and Kokoro model phoneme symbols.

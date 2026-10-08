@@ -6,6 +6,7 @@
 pub mod code_predictor;
 pub mod config;
 pub mod model;
+mod sampling;
 pub mod speech_tokenizer;
 pub mod talker;
 

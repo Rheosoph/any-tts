@@ -271,6 +271,16 @@ impl Qwen3TtsModel {
 
     /// Validate the synthesis request (voice cloning, voice name, language).
     fn validate_request(&self, request: &SynthesisRequest) -> Result<(), TtsError> {
+        if request.speed.is_some() {
+            return Err(TtsError::ModelError(
+                "Qwen3-TTS does not support explicit speaking speed".into(),
+            ));
+        }
+        if request.max_tokens == Some(0) || request.temperature.is_some_and(|v| !v.is_finite()) {
+            return Err(TtsError::ConfigError(
+                "max_tokens must be positive and temperature finite".into(),
+            ));
+        }
         if request.reference_audio.is_some() || request.voice_embedding.is_some() {
             return Err(TtsError::ModelError(
                 "Qwen3-TTS: voice cloning from reference audio is not yet implemented. \

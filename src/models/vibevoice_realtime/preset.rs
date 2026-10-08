@@ -14,7 +14,6 @@ use super::runtime::RealtimeDecoderState;
 
 #[derive(Clone)]
 pub struct VoicePresetBranch {
-    pub prompt_len: usize,
     pub state: RealtimeDecoderState,
 }
 
@@ -111,7 +110,6 @@ fn build_branch<R: Read + std::io::Seek>(
             .into_layer_caches(archive, root_prefix, device, runtime_dtype)?;
 
     Ok(VoicePresetBranch {
-        prompt_len,
         state: RealtimeDecoderState::new(prompt_len, last_hidden, layer_caches),
     })
 }
@@ -303,10 +301,12 @@ impl DynamicCacheDescriptor {
         }
 
         let mut caches = Vec::with_capacity(self.key_cache.len());
-        for (key, value) in self.key_cache.into_iter().zip(self.value_cache.into_iter()) {
+        for (key, value) in self.key_cache.into_iter().zip(self.value_cache) {
             let key = key.materialize(archive, root_prefix, device, runtime_dtype)?;
             let value = value.materialize(archive, root_prefix, device, runtime_dtype)?;
-            caches.push(Some((key, value)));
+            caches.push(Some(crate::layers::kv_cache::KvCacheState::from_tensors(
+                key, value,
+            )?));
         }
         Ok(caches)
     }

@@ -1,38 +1,17 @@
-//! Text-to-phoneme conversion for Kokoro-82M.
+//! Deterministic, in-process phonemization using Kokoro's trained token alphabet.
 //!
-//! Converts plain text to Kokoro-compatible IPA phoneme strings using an
-//! in-tree pure-Rust `espeak-rs` compatibility layer.
+//! English uses sentence-aware US/GB dictionaries and a bounded Rust rule
+//! fallback. Other languages use the in-tree compatibility frontend. No external
+//! program is invoked and no runtime downloads are performed.
 
 use std::collections::HashMap;
 
+use super::espeak_compat::{canonical_language, text_to_phonemes};
 use crate::error::{TtsError, TtsResult};
 
-use super::espeak_compat::text_to_phonemes;
-
-fn lang_to_espeak(lang: &str) -> &'static str {
-    match lang {
-        "en" | "en-us" | "a" => "en-us",
-        "en-gb" | "b" => "en-gb",
-        "ja" | "j" => "ja",
-        "zh" | "z" => "cmn",
-        "ko" | "k" => "ko",
-        "fr" | "f" => "fr",
-        "de" | "d" => "de",
-        "it" | "i" => "it",
-        "pt" | "p" => "pt",
-        "es" | "e" => "es",
-        "hi" | "h" => "hi",
-        _ => "en-us",
-    }
-}
-
 /// Infer the language from a Kokoro voice name's first letter.
-///
-/// Kokoro voice naming convention:
-///   first letter = language (a=American, b=British, e=Spanish, f=French,
-///   h=Hindi, i=Italian, j=Japanese, p=Portuguese, z=Chinese)
 pub fn language_from_voice(voice: &str) -> &'static str {
-    match voice.chars().next() {
+    match voice.chars().next().map(|ch| ch.to_ascii_lowercase()) {
         Some('a') => "en",
         Some('b') => "en-gb",
         Some('e') => "es",
@@ -47,283 +26,229 @@ pub fn language_from_voice(voice: &str) -> &'static str {
     }
 }
 
-fn apply_kokoro_replacements(phonemes: &str) -> String {
-    let mut s = phonemes
-        .replace('ʲ', "j")
-        .replace('ɝ', "ɚ")
-        .replace('g', "ɡ")
-        .replace('x', "k")
-        .replace("ɬ", "l");
-
-    // Remove tie bars (espeak uses combining tie U+0361 for affricates)
-    s = s.replace('\u{0361}', "");
-
-    s
+fn language_code(language: &str) -> TtsResult<&'static str> {
+    canonical_language(language).ok_or_else(|| {
+        TtsError::TokenizerError(format!(
+            "Unsupported Kokoro phonemizer language: {language}"
+        ))
+    })
 }
 
-/// Filter a phoneme string to only characters present in the Kokoro vocab.
-fn filter_to_vocab(phonemes: &str, vocab: &HashMap<String, u32>) -> String {
-    phonemes
-        .chars()
-        .filter(|c| {
-            let mut buf = [0; 4];
-            vocab.contains_key(c.encode_utf8(&mut buf))
-        })
-        .collect()
-}
-
-fn is_kokoro_vowel(c: char) -> bool {
-    matches!(
-        c,
-        'a' | 'e' | 'i' | 'o' | 'u'
-            | 'ɑ' | 'ɐ' | 'ɒ' | 'æ' | 'ɔ' | 'ə' | 'ɚ' | 'ɛ' | 'ɜ' | 'ɨ' | 'ɪ' | 'ɯ' | 'ʌ' | 'ɣ' | 'ɤ' | 'ʊ' | 'ʏ'
-            | 'A' | 'I' | 'O' | 'Q' | 'S' | 'T' | 'W' | 'Y' | 'ᵻ'
-    )
-}
-
-fn map_g2p_to_kokoro_ipa(ph: &str) -> String {
-    // voice_g2p maps several standard Arpabet sounds to single-character shorthand tokens.
-    // While present in the tokenizer vocabulary JSON, the model weights expect standard
-    // multi-character espeak-ng IPA sequences. Translating them here prevents dropouts.
-    ph.replace('A', "eɪ")  // EY -> eɪ (e.g. "bait" -> bˈeɪt, "became" -> bəkˈeɪm)
-      .replace('I', "aɪ")  // AY -> aɪ (e.g. "bite" -> bˈaɪt, "I" -> ˌaɪ)
-      .replace('O', "oʊ")  // OW -> oʊ (e.g. "boat" -> bˈoʊt)
-      .replace('W', "aʊ")  // AW -> aʊ (e.g. "now" -> nˈaʊ, "without" -> wɪðˈaʊt)
-      .replace('Y', "ɔɪ")  // OY -> ɔɪ (e.g. "boy" -> bˈɔɪ)
-      .replace('T', "t")   // DX/T flap-t -> t (e.g. "hitting" -> hˈɪtɪŋ)
-      .replace('Q', "juː") // UW/YUW -> juː
-      .replace('S', "ʃ")   // SH -> ʃ (e.g. "she" -> ʃi)
-      .replace('D', "ð")   // DH -> ð (e.g. "this" -> ðˈɪs)
-      .replace('ʧ', "tʃ")  // voiceless postalveolar affricate -> tʃ (e.g. "virtually" -> vˈɜɹtʃəwəli)
-      .replace('ʤ', "dʒ")  // voiced postalveolar affricate -> dʒ (e.g. "gin" -> dʒˈɪn)
-}
-
-fn phonemize_token_hybrid(word: &str, espeak_lang: &str, vocab: &HashMap<String, u32>) -> String {
-    let normalized = word.to_lowercase();
-
-    if let Some(ipa) = super::english_g2p::lookup_dialect_word(&normalized, espeak_lang == "en-gb")
-    {
-        return map_g2p_to_kokoro_ipa(ipa);
-    }
-
-    let mut ph = voice_g2p::english_to_phonemes(word)
-        .map(|p| map_g2p_to_kokoro_ipa(&p))
-        .ok()
-        .filter(|p| {
-            !p.trim().is_empty()
-                && p.chars().any(|c| {
-                    c.is_alphabetic() || {
-                        let mut buf = [0; 4];
-                        vocab.contains_key(c.encode_utf8(&mut buf))
-                    }
-                })
-        })
-        .unwrap_or_else(|| {
-            text_to_phonemes(word, espeak_lang, None, true, false)
-                .map(|p| p.join(""))
-                .unwrap_or_default()
-        });
-
-    // Strip leading stress markers from the start of the token ONLY if followed by a consonant.
-    // Putting a stress marker before a consonant (e.g. "ˈf") causes Kokoro to mispronounce it as "ah".
-    // But stress markers before vowels (e.g. "ˌaɪ", "ˈæ") are required and must be preserved.
-    while ph.starts_with('ˈ') || ph.starts_with('ˌ') {
-        if let Some(next_char) = ph.chars().nth(1) {
-            if !is_kokoro_vowel(next_char) {
-                ph.remove(0);
-                continue;
-            }
-        }
-        break;
-    }
-    ph
-}
-
-/// Convert plain text to Kokoro-compatible IPA phoneme string.
+/// Initialize the immutable dictionaries before serving the first request.
 ///
-/// Pipeline:
-/// 1. For English, run the hybrid G2P pipeline (phonemize_token_hybrid custom rules + espeak fallback)
-/// 2. For other languages, use the pure-Rust `espeak-rs` compatibility layer
-/// 3. Apply Kokoro-specific cleanup
-/// 4. Filter to only characters in the Kokoro vocab
+/// Optional: normal phonemization initializes lazily. US and GB lexicons are
+/// cached independently; both share one POS tagger. Calling this concurrently is
+/// safe. Rule-only languages have no initialization work.
+pub fn prewarm(language: &str) -> TtsResult<()> {
+    match language_code(language)? {
+        lang @ ("en-us" | "en-gb") => {
+            let _ = super::g2p::engine(lang == "en-gb").convert("");
+        }
+        "ja" => super::espeak_compat::prewarm_japanese()
+            .map_err(|err| TtsError::ModelError(err.to_string()))?,
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Normalize compatibility glyphs and filter once against the actual model
+/// vocabulary. Preserve Misaki tokens A/I/O/Q/W/Y, affricates, stress, and flaps:
+/// they name distinct trained embeddings and must not be expanded to IPA.
+fn model_phonemes(phonemes: &str, vocab: &HashMap<String, u32>) -> String {
+    let mut output = String::with_capacity(phonemes.len());
+    for ch in phonemes.chars() {
+        let ch = match ch {
+            'g' => 'ɡ',
+            'ɝ' => 'ɚ',
+            // Compatibility fallback for a lateral absent from the v1 alphabet.
+            // x and ʲ ARE trained non-English symbols and must remain intact.
+            'ɬ' => 'l',
+            // Normalize spacing without introducing sentence boundaries.
+            ch if ch.is_whitespace() => ' ',
+            '\u{0361}' => continue,
+            ch => ch,
+        };
+        let mut buf = [0; 4];
+        if vocab.contains_key(ch.encode_utf8(&mut buf)) && (ch != ' ' || !output.ends_with(' ')) {
+            output.push(ch);
+        }
+    }
+    output.trim().to_string()
+}
+
+/// Convert text into the exact phoneme symbols expected by Kokoro's vocabulary.
+/// Unsupported language codes and inputs without any speakable phonemes fail
+/// explicitly instead of silently synthesizing English or punctuation-only audio.
 pub fn phonemize(text: &str, language: &str, vocab: &HashMap<String, u32>) -> TtsResult<String> {
-    let espeak_lang = lang_to_espeak(language);
-
-    // English spelling is highly non-phonetic and requires a G2P dictionary lookup (voice-g2p)
-    // to avoid robotic espeak accents. Other languages are highly phonetic or rules-consistent,
-    // so they are phonemized at the sentence level to preserve natural word linking (liaison).
-    let joined = if espeak_lang == "en-us" || espeak_lang == "en-gb" {
-        // Hybrid G2P: convert word-by-word to preserve OOV terms (like names or code symbols)
-        let mut output = String::new();
-        let mut token = String::new();
-        for ch in text.chars() {
-            if ch.is_alphanumeric() || matches!(ch, '\'' | '’' | '-') {
-                token.push(ch);
-            } else {
-                if !token.is_empty() {
-                    output.push_str(&phonemize_token_hybrid(&token, espeak_lang, vocab));
-                    token.clear();
-                }
-                output.push(ch);
-            }
-        }
-        if !token.is_empty() {
-            output.push_str(&phonemize_token_hybrid(&token, espeak_lang, vocab));
-        }
-        output
+    let language = language_code(language)?;
+    let joined = if matches!(language, "en-us" | "en-gb") {
+        let normalized = super::text_normalization::normalize_numbers(text, language);
+        super::g2p::engine(language == "en-gb").convert(&normalized)
     } else {
-        let raw_phonemes = text_to_phonemes(text, espeak_lang, None, true, false).map_err(|e| {
-            TtsError::ModelError(format!(
-                "pure-Rust phonemization failed for lang '{language}' (compat voice '{espeak_lang}'): {e}"
-            ))
-        })?;
-        raw_phonemes.join("")
+        text_to_phonemes(text, language, None, true, false)
+            .map_err(|err| TtsError::TokenizerError(err.to_string()))?
+            .join(" ")
     };
-
-    let replaced = apply_kokoro_replacements(&joined);
-    let filtered = filter_to_vocab(&replaced, vocab);
-
-    if filtered.is_empty() {
+    if joined.chars().any(|ch| ch.is_numeric()) {
         return Err(TtsError::TokenizerError(format!(
-            "Phonemization produced no valid tokens for text: \"{text}\" (lang: {language})"
+            "Unnormalized numeric content in phonemizer output (lang: {language})"
         )));
     }
-
-    Ok(filtered)
+    let output = model_phonemes(&joined, vocab);
+    if !output.chars().any(char::is_alphabetic) {
+        return Err(TtsError::TokenizerError(format!(
+            "Phonemization produced no speakable tokens (lang: {language})"
+        )));
+    }
+    Ok(output)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn dummy_vocab() -> HashMap<String, u32> {
-        // Build a minimal vocab containing common IPA chars
-        let chars = "$;:,.!?¡¿—…\"«»\u{201c}\u{201d} \
-            ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnoprstuvwxyz\
-            ɑɐɒæɓʙβɔɕçɗɖðʤəɘɚɛɜɝɞɟʄɡɠɢʛɦɧħɥʜɨɪʝɭɬɫɮʟɱɯɰ\
-            ŋɳɲɴøɵɸθœɶʘɹɺɾɻʀʁɽʂʃʈʧʉʊʋⱱʌɣɤʍχʎʏʑʐʒʔʡʕʢ\
-            ǀǁǂǃˈˌːˑʼʴʰʱʲʷˠˤ˞↓↑→↗↘ᵻᵊ";
-        let mut vocab = HashMap::new();
-        for (i, c) in chars.chars().enumerate() {
-            vocab.insert(c.to_string(), i as u32);
+    // Source: hexgrad/Kokoro-82M config.json, vocab section (v1, n_token=178).
+    // The fixture uses the actual trained IDs, not a permissive synthetic alphabet.
+    fn vocab() -> HashMap<String, u32> {
+        serde_json::from_str(include_str!("fixtures/kokoro-v1-vocab.json")).unwrap()
+    }
+    fn phones(text: &str, lang: &str) -> String {
+        phonemize(text, lang, &vocab()).unwrap()
+    }
+
+    #[test]
+    fn preserves_trained_diphthong_affricate_and_flap_ids() {
+        let vocab = vocab();
+        assert_eq!(phones("now", "en"), "nˈW");
+        assert_eq!(phones("church", "en"), "ʧˈɜɹʧ");
+        let ids: Vec<_> = phones("church", "en")
+            .chars()
+            .map(|ch| vocab[&ch.to_string()])
+            .collect();
+        assert_eq!(ids, [133, 156, 87, 123, 133]);
+        assert!(phones("hitting", "en").contains('T'));
+        assert!(phones("go", "en-gb").contains('Q'));
+    }
+
+    #[test]
+    fn retains_non_english_fricatives_and_palatalization() {
+        let vocab = vocab();
+        assert_eq!(vocab["x"], 66);
+        assert_eq!(vocab["ʲ"], 164);
+        assert_eq!(model_phonemes("xʲɬ", &vocab), "xʲl");
+        for word in ["gente", "joven"] {
+            let output = phones(word, "es");
+            assert!(output.contains('χ'), "{word}: {output}");
+            assert_eq!(vocab["χ"], 142);
         }
-        vocab
+        assert!(phones("ぎゃ", "ja").contains("ɡj"));
     }
 
     #[test]
-    fn test_language_from_voice() {
-        assert_eq!(language_from_voice("af_heart"), "en");
-        assert_eq!(language_from_voice("dm_speaker"), "en"); // unknown prefix
-        assert_eq!(language_from_voice("jf_alpha"), "ja");
-        assert_eq!(language_from_voice("ef_dora"), "es");
-        assert_eq!(language_from_voice("ff_siwis"), "fr");
-    }
-
-    #[test]
-    fn test_kokoro_replacements() {
-        let input = "ʲrgxɬɝ";
-        let output = apply_kokoro_replacements(input);
-        assert_eq!(output, "jrɡklɚ");
-    }
-
-    #[test]
-    fn test_phonemize_english() {
-        let vocab = dummy_vocab();
-        let result = phonemize("Hello world", "en", &vocab);
-        assert!(result.is_ok(), "phonemize failed: {:?}", result.err());
-        let ph = result.unwrap();
-        assert!(!ph.is_empty(), "phonemes should not be empty");
-        // Should contain IPA characters, not ASCII "Hello"
+    fn keeps_sentence_context_for_heteronyms_and_articles() {
+        assert!(phones("I read a book yesterday", "en").contains("ɹˈɛd"));
+        assert!(phones("I will read a book", "en").contains("ɹˈid"));
+        let record = phones("They record a record", "en");
         assert!(
-            ph.contains('ə') || ph.contains('ɛ') || ph.contains('ˈ') || ph.contains('l'),
-            "Expected IPA phonemes, got: {ph}"
+            record.contains("ɹəkˈɔɹd") && record.contains("ɹˈɛkəɹd"),
+            "{record}"
         );
+        assert!(phones("the apple", "en").starts_with("ði "));
     }
 
     #[test]
-    fn test_phonemize_british_english_variant() {
-        let vocab = dummy_vocab();
-        let us = phonemize("schedule", "en", &vocab).expect("US phonemization should work");
-        let gb = phonemize("schedule", "en-gb", &vocab).expect("British phonemization should work");
-
-        assert!(!us.is_empty());
-        assert!(!gb.is_empty());
-        assert_ne!(us, gb, "expected dialect-specific phoneme output");
-    }
-
-    #[test]
-    fn test_phonemize_multilingual_smoke() {
-        let vocab = dummy_vocab();
-        for (text, lang) in [
-            ("Hola mundo", "es"),
-            ("Bonjour le monde", "fr"),
-            ("Guten Tag", "de"),
-            ("Ciao mondo", "it"),
-            ("Olá mundo", "pt"),
-            ("こんにちは世界", "ja"),
-            ("你好世界", "zh"),
-            ("안녕하세요", "ko"),
-            ("नमस्ते दुनिया", "hi"),
+    fn english_numbers_currency_and_symbols_are_spoken() {
+        for (source, expanded) in [
+            ("$12.50", "twelve dollars and fifty cents"),
+            ("1,000", "one thousand"),
+            ("3.14", "three point one four"),
+            ("50%", "fifty percent"),
+            ("21st", "twenty first"),
+            ("10:03", "ten oh three"),
         ] {
-            let result = phonemize(text, lang, &vocab);
-            assert!(
-                result.is_ok(),
-                "phonemize failed for {lang}: {:?}",
-                result.err()
+            // Compare without stress: words and numbers can legitimately assign
+            // different phrase stresses while spelling the same spoken content.
+            let strip = |s: String| s.replace(['ˈ', 'ˌ'], "");
+            assert_eq!(
+                strip(phones(source, "en")),
+                strip(phones(expanded, "en")),
+                "{source}"
             );
-            assert!(
-                !result.unwrap().is_empty(),
-                "expected non-empty phonemes for {lang}"
-            );
+        }
+        assert!(phones("A & B", "en").contains("ænd"));
+    }
+
+    #[test]
+    fn fallback_does_not_invent_sentence_breaks() {
+        let text = phones("my phonemizer works", "en");
+        assert!(!text.contains('.'), "{text}");
+        assert_eq!(phones("phonemizer.", "en").matches('.').count(), 1);
+        // Warm cache and cold lookup must preserve both stress and token content.
+        assert_eq!(phones("phonemizer", "en"), phones("phonemizer", "en"));
+    }
+
+    #[test]
+    fn british_lexicon_covers_words_outside_old_overrides() {
+        let us = phones("bath car tomato bird", "en");
+        let gb = phones("bath car tomato bird", "en-gb");
+        assert_ne!(us, gb);
+        assert!(
+            us.contains("bˈæθ") && gb.contains("bˈɑːθ"),
+            "us={us}, gb={gb}"
+        );
+        assert!(!phones("car", "en-gb").contains('ɹ'));
+        assert!(phones("bird", "en-gb").contains("ɜː"));
+    }
+
+    #[test]
+    fn normalizes_aliases_and_rejects_unknown_languages() {
+        for (alias, canonical, text) in [
+            ("ES", "es", "Hola"),
+            ("pt-BR", "pt", "Olá"),
+            ("fr_FR", "fr", "Bonjour"),
+            ("en_GB", "en-gb", "bird"),
+        ] {
+            assert_eq!(phones(text, alias), phones(text, canonical));
+        }
+        assert!(phonemize("hello", "typo", &vocab()).is_err());
+        for text in ["", "   ", "!!!", "🙂"] {
+            assert!(phonemize(text, "en", &vocab()).is_err(), "{text}");
         }
     }
 
     #[test]
-    fn test_filter_to_vocab() {
-        let mut vocab = HashMap::new();
-        vocab.insert("a".to_string(), 1);
-        vocab.insert("b".to_string(), 2);
-        assert_eq!(filter_to_vocab("abc", &vocab), "ab");
+    fn multilingual_numbers_survive_real_vocabulary_filtering() {
+        for (lang, word) in [
+            ("fr", "trois"),
+            ("de", "drei"),
+            ("es", "tres"),
+            ("it", "tre"),
+            ("pt", "três"),
+            ("ja", "三"),
+            ("zh", "三"),
+            ("ko", "삼"),
+            ("hi", "तीन"),
+        ] {
+            assert_eq!(phones("3", lang), phones(word, lang), "{lang}");
+            let decimal = phones("3.14", lang);
+            assert!(
+                decimal.chars().filter(|ch| ch.is_alphabetic()).count() > 1,
+                "{lang}: {decimal}"
+            );
+            assert!(phonemize("...", lang, &vocab()).is_err());
+        }
+        assert!(phones("12,50 €", "fr").chars().any(char::is_alphabetic));
     }
 
     #[test]
-    fn test_phonemizer_g2p_leading_stress() {
-        let vocab = dummy_vocab();
-        
-        // Vowel-associated stress preserved, G2P mapped 'I' to 'aɪ'
-        let result_i = phonemize("I have", "en", &vocab).unwrap();
-        assert!(result_i.contains("ˌaɪ"), "Should preserve stress marker and map 'I' to 'aɪ': {}", result_i);
-
-        // Consonant-associated stress stripped on consonant 'f'
-        let result_ph = phonemize("phonemizer", "en", &vocab).unwrap();
-        assert_eq!(result_ph, "fɑnɛmɪzɚ.");
-
-        // "now" -> nˈaʊ
-        let result_now = phonemize("now", "en", &vocab).unwrap();
-        assert_eq!(result_now, "nˈaʊ");
-
-        // "hitting" -> hˈɪtɪŋ
-        let result_hitting = phonemize("hitting", "en", &vocab).unwrap();
-        assert_eq!(result_hitting, "hˈɪtɪŋ");
-
-        // "automatically" -> ˌɔtəmˈætəkᵊli
-        let result_auto = phonemize("automatically", "en", &vocab).unwrap();
-        assert_eq!(result_auto, "ˌɔtəmˈætəkᵊli");
-
-        // "data" -> dˈeɪtə
-        let result_data = phonemize("data", "en", &vocab).unwrap();
-        assert_eq!(result_data, "dˈeɪtə");
-
-        // "Compatibility" -> kəmpˌætəbˈɪləti
-        let result_compat = phonemize("Compatibility", "en", &vocab).unwrap();
-        assert_eq!(result_compat, "kəmpˌætəbˈɪləti");
-
-        // "without" -> wɪðˈaʊt
-        let result_without = phonemize("without", "en", &vocab).unwrap();
-        assert_eq!(result_without, "wɪðˈaʊt");
-
-        // "walkthrough" -> wˈɔkθɹuː
-        let result_walkthrough = phonemize("walkthrough", "en", &vocab).unwrap();
-        assert_eq!(result_walkthrough, "wˈɔkθɹuː");
+    fn japanese_requests_can_share_the_immutable_dictionary() {
+        prewarm("ja").unwrap();
+        let expected = phones("こんにちは世界", "ja");
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let expected = &expected;
+                scope.spawn(move || assert_eq!(phones("こんにちは世界", "ja"), *expected));
+            }
+        });
     }
 }

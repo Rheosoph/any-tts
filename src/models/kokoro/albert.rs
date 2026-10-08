@@ -19,14 +19,6 @@ use candle_nn::VarBuilder;
 use super::config::PlbertConfig;
 use crate::tensor_utils::cpu_flash_attention;
 
-fn scalar_like(tensor: &Tensor, value: f32) -> Result<Tensor> {
-    Tensor::new(value, tensor.device())?.to_dtype(tensor.dtype())
-}
-
-fn scale_tensor(tensor: &Tensor, value: f32) -> Result<Tensor> {
-    tensor.broadcast_mul(&scalar_like(tensor, value)?)
-}
-
 /// ALBERT model for PL-BERT text encoding.
 pub struct Albert {
     word_embeddings: candle_nn::Embedding,
@@ -125,8 +117,21 @@ impl Albert {
     ///
     /// Returns: [batch, seq_len, hidden_size]
     pub fn forward(&self, input_ids: &Tensor, attention_mask: &Tensor) -> Result<Tensor> {
-        let (_batch, seq_len) = input_ids.dims2()?;
+        self.forward_impl(input_ids, Some(attention_mask))
+    }
+
+    /// Encode an unpadded sequence without allocating a no-op attention mask.
+    pub fn forward_unmasked(&self, input_ids: &Tensor) -> Result<Tensor> {
+        self.forward_impl(input_ids, None)
+    }
+
+    fn forward_impl(&self, input_ids: &Tensor, attention_mask: Option<&Tensor>) -> Result<Tensor> {
+        let (batch, seq_len) = input_ids.dims2()?;
         let device = input_ids.device();
+        let max_positions = self.position_embeddings.embeddings().dim(0)?;
+        if seq_len == 0 || seq_len > max_positions {
+            candle_core::bail!("ALBERT input length {seq_len} is outside 1..={max_positions}");
+        }
 
         // Build position IDs
         let position_ids: Vec<u32> = (0..seq_len as u32).collect();
@@ -151,19 +156,22 @@ impl Albert {
             None => embeddings,
         };
 
-        // Build causal attention mask: [batch, 1, 1, seq_len]
-        let attn_mask = attention_mask
-            .to_dtype(hidden.dtype())?
-            .unsqueeze(1)?
-            .unsqueeze(2)?;
-        // Convert 0/1 mask to additive mask: 0 → 0.0, 1 → -10000.0 inverted
-        // Actually: 1 means attend, 0 means don't → we need (1-mask)*-10000
-        let inv_mask = attn_mask.neg()?.add(&Tensor::ones_like(&attn_mask)?)?;
-        let attn_bias = inv_mask.broadcast_mul(&scalar_like(&inv_mask, -10000.0)?)?;
+        // ALBERT is bidirectional. A mask only excludes padding positions.
+        let attn_bias = attention_mask
+            .map(|mask| -> Result<Tensor> {
+                if mask.dims() != [batch, seq_len] {
+                    candle_core::bail!("ALBERT attention mask must match input shape");
+                }
+                mask.to_dtype(hidden.dtype())?
+                    .affine(10000.0, -10000.0)?
+                    .unsqueeze(1)?
+                    .unsqueeze(2)
+            })
+            .transpose()?;
 
         // Apply shared layer N times
         for _ in 0..self.num_hidden_layers {
-            hidden = self.shared_layer.forward(&hidden, &attn_bias)?;
+            hidden = self.shared_layer.forward(&hidden, attn_bias.as_ref())?;
         }
 
         Ok(hidden)
@@ -207,7 +215,7 @@ impl AlbertLayer {
         })
     }
 
-    fn forward(&self, hidden: &Tensor, attn_bias: &Tensor) -> Result<Tensor> {
+    fn forward(&self, hidden: &Tensor, attn_bias: Option<&Tensor>) -> Result<Tensor> {
         // Self-attention + residual + layer norm
         let attn_out = self.attention.forward(hidden, attn_bias)?;
         let hidden = self.attention_norm.forward(&hidden.add(&attn_out)?)?;
@@ -241,7 +249,7 @@ impl AlbertAttention {
         })
     }
 
-    fn forward(&self, hidden: &Tensor, attn_bias: &Tensor) -> Result<Tensor> {
+    fn forward(&self, hidden: &Tensor, attn_bias: Option<&Tensor>) -> Result<Tensor> {
         let (batch, seq_len, _) = hidden.dims3()?;
 
         let q = self.query.forward(hidden)?;
@@ -264,18 +272,20 @@ impl AlbertAttention {
 
         // Scaled dot-product attention
         let scale = 1.0f32 / (self.head_dim as f32).sqrt();
-        let attn_out = if let Some(cpu_attn_out) =
-            cpu_flash_attention(&q, &k, &v, Some(attn_bias), scale)?
-        {
-            cpu_attn_out
-        } else {
-            let k_t = k.transpose(2, 3)?.contiguous()?;
-            let attn_weights = q.matmul(&k_t)?;
-            let attn_weights = scale_tensor(&attn_weights, scale)?;
-            let attn_weights = attn_weights.broadcast_add(attn_bias)?;
-            let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-            attn_weights.matmul(&v)?
-        };
+        let attn_out =
+            if let Some(cpu_attn_out) = cpu_flash_attention(&q, &k, &v, attn_bias, scale)? {
+                cpu_attn_out
+            } else {
+                let k_t = k.transpose(2, 3)?.contiguous()?;
+                let attn_weights = q.matmul(&k_t)?;
+                let attn_weights = attn_weights.affine(scale as f64, 0.0)?;
+                let attn_weights = match attn_bias {
+                    Some(bias) => attn_weights.broadcast_add(bias)?,
+                    None => attn_weights,
+                };
+                let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+                attn_weights.matmul(&v)?
+            };
         let attn_out =
             attn_out
                 .transpose(1, 2)?
@@ -287,6 +297,97 @@ impl AlbertAttention {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn test_unmasked_attention_matches_dense_reference() {
+        let device = Device::Cpu;
+        let linear = |offset: f32| {
+            let values = (0..64)
+                .map(|i| (i as f32 * 0.23 + offset).sin() * 0.2)
+                .collect::<Vec<_>>();
+            candle_nn::Linear::new(Tensor::from_vec(values, (8, 8), &device).unwrap(), None)
+        };
+        let attention = AlbertAttention {
+            query: linear(0.0),
+            key: linear(0.5),
+            value: linear(1.0),
+            dense: linear(1.5),
+            num_heads: 2,
+            head_dim: 4,
+        };
+        let input = Tensor::new(
+            (0..40).map(|i| (i as f32 * 0.17).cos()).collect::<Vec<_>>(),
+            &device,
+        )
+        .unwrap()
+        .reshape((1, 5, 8))
+        .unwrap();
+        let project = |linear: &candle_nn::Linear| {
+            linear
+                .forward(&input)
+                .unwrap()
+                .reshape((1, 5, 2, 4))
+                .unwrap()
+                .transpose(1, 2)
+                .unwrap()
+                .contiguous()
+                .unwrap()
+        };
+        let q = project(&attention.query);
+        let k = project(&attention.key);
+        let v = project(&attention.value);
+        let scores = q
+            .matmul(&k.transpose(2, 3).unwrap().contiguous().unwrap())
+            .unwrap()
+            .affine(0.5, 0.0)
+            .unwrap();
+        let expected = candle_nn::ops::softmax_last_dim(&scores)
+            .unwrap()
+            .matmul(&v)
+            .unwrap()
+            .transpose(1, 2)
+            .unwrap()
+            .reshape((1, 5, 8))
+            .unwrap();
+        let expected = attention.dense.forward(&expected).unwrap();
+        let actual = attention.forward(&input, None).unwrap();
+        let error = actual
+            .sub(&expected)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(error < 1e-6, "CPU attention parity error: {error}");
+    }
+
+    #[test]
+    fn test_albert_rejects_context_overflow() {
+        let mut config: PlbertConfig = serde_json::from_str("{}").unwrap();
+        config.hidden_size = 8;
+        config.embedding_size = 4;
+        config.intermediate_size = 16;
+        config.num_attention_heads = 2;
+        config.num_hidden_layers = 1;
+        config.max_position_embeddings = 4;
+        let device = Device::Cpu;
+        let model = Albert::load(
+            &config,
+            VarBuilder::zeros(candle_core::DType::F32, &device),
+            &device,
+        )
+        .unwrap();
+        let input = Tensor::zeros((1, 5), candle_core::DType::U32, &device).unwrap();
+        assert!(model
+            .forward_unmasked(&input)
+            .unwrap_err()
+            .to_string()
+            .contains("outside 1..=4"));
+    }
+
     #[test]
     fn test_albert_config_defaults() {
         use super::super::config::PlbertConfig;

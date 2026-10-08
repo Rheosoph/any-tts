@@ -38,6 +38,7 @@ impl SpeechConnector {
 
 pub(crate) struct VibeVoiceLanguageModel {
     embed_tokens: Embedding,
+    control_head: Tensor,
     layers: Vec<TransformerBlock>,
     norm: RmsNorm,
     rope_cos: Tensor,
@@ -51,6 +52,7 @@ impl VibeVoiceLanguageModel {
         vb: VarBuilder,
         device: &Device,
         dtype: DType,
+        control_tokens: &[u32],
     ) -> Result<Self, TtsError> {
         let head_dim = config.hidden_size / config.num_attention_heads;
         let gqa_config = GqaConfig::with_head_dim(
@@ -66,6 +68,11 @@ impl VibeVoiceLanguageModel {
 
         let embed_tokens =
             candle_nn::embedding(config.vocab_size, config.hidden_size, vb.pp("embed_tokens"))?;
+        let control_ids = Tensor::new(control_tokens, device)?;
+        let control_head = embed_tokens
+            .forward(&control_ids)?
+            .transpose(0, 1)?
+            .contiguous()?;
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for index in 0..config.num_hidden_layers {
@@ -87,6 +94,7 @@ impl VibeVoiceLanguageModel {
 
         Ok(Self {
             embed_tokens,
+            control_head,
             layers,
             norm,
             rope_cos,
@@ -99,22 +107,27 @@ impl VibeVoiceLanguageModel {
         self.embed_tokens.forward(token_ids)
     }
 
-    pub(crate) fn prefill(&mut self, input_embeds: &Tensor) -> Result<DecoderCacheState, TtsError> {
+    pub(crate) fn prefill(
+        &mut self,
+        input_embeds: &Tensor,
+        project_logits: bool,
+    ) -> Result<DecoderCacheState, TtsError> {
         let (_batch, seq_len, _hidden) = input_embeds.dims3()?;
         self.clear_cache();
         let mask = causal_mask(seq_len, input_embeds.device(), self.dtype)?;
         let hidden = self.forward_hidden(input_embeds, 0, mask.as_ref())?;
-        self.capture_decode_state(hidden, seq_len)
+        self.capture_decode_state(hidden, seq_len, project_logits)
     }
 
     pub(crate) fn decode_step(
         &mut self,
         input_embedding: &Tensor,
         start_pos: usize,
+        project_logits: bool,
     ) -> Result<DecoderCacheState, TtsError> {
         let input_embeds = step_input_embeddings(input_embedding)?;
         let hidden = self.forward_hidden(&input_embeds, start_pos, None)?;
-        self.capture_decode_state(hidden, start_pos + 1)
+        self.capture_decode_state(hidden, start_pos + 1, project_logits)
     }
 
     pub(crate) fn load_cache_state(
@@ -130,7 +143,7 @@ impl VibeVoiceLanguageModel {
         }
 
         for (layer, cache_entry) in self.layers.iter_mut().zip(cache_state.iter()) {
-            layer.set_cache_state(cache_entry.clone());
+            layer.restore_cache(cache_entry.clone());
         }
         Ok(())
     }
@@ -145,9 +158,14 @@ impl VibeVoiceLanguageModel {
         &self,
         hidden: Tensor,
         next_position: usize,
+        project_logits: bool,
     ) -> Result<DecoderCacheState, TtsError> {
         let last_hidden = hidden.narrow(1, hidden.dim(1)? - 1, 1)?.squeeze(1)?;
-        let logits = self.next_logits(&last_hidden)?;
+        let logits = if project_logits {
+            Some(self.next_logits(&last_hidden)?)
+        } else {
+            None
+        };
         Ok(DecoderCacheState::new(
             next_position,
             last_hidden,
@@ -159,7 +177,7 @@ impl VibeVoiceLanguageModel {
     fn capture_cache_state(&self) -> Vec<LayerKvCache> {
         self.layers
             .iter()
-            .map(TransformerBlock::cache_state)
+            .map(TransformerBlock::snapshot_cache)
             .collect()
     }
 
@@ -177,8 +195,7 @@ impl VibeVoiceLanguageModel {
     }
 
     fn next_logits(&self, last_hidden: &Tensor) -> CandleResult<Tensor> {
-        let weight = self.embed_tokens.embeddings().transpose(0, 1)?;
-        last_hidden.matmul(&weight)
+        last_hidden.matmul(&self.control_head)
     }
 }
 
@@ -255,5 +272,58 @@ fn step_input_embeddings(input_embedding: &Tensor) -> Result<Tensor, TtsError> {
         _ => Err(TtsError::ModelError(
             "Unexpected VibeVoice embedding rank while decoding incrementally".to_string(),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn control_projection_matches_full_vocabulary_and_negative_states_skip_it() {
+        let device = Device::Cpu;
+        let config = VibeVoiceDecoderConfig {
+            vocab_size: 19,
+            hidden_size: 8,
+            intermediate_size: 12,
+            num_attention_heads: 2,
+            num_key_value_heads: 2,
+            num_hidden_layers: 1,
+            max_position_embeddings: 16,
+            ..Default::default()
+        };
+        let variables = candle_nn::VarMap::new();
+        let vb = VarBuilder::from_varmap(&variables, DType::F32, &device);
+        let tokens = [17u32, 3, 12, 6];
+        let mut model =
+            VibeVoiceLanguageModel::load(&config, vb, &device, DType::F32, &tokens).unwrap();
+        let input = model
+            .embed(&Tensor::new(&[[1u32, 2]], &device).unwrap())
+            .unwrap();
+        let state = model.prefill(&input, true).unwrap();
+        let full = state
+            .last_hidden()
+            .matmul(&model.embed_tokens.embeddings().transpose(0, 1).unwrap())
+            .unwrap();
+        let expected = full
+            .index_select(&Tensor::new(&tokens, &device).unwrap(), 1)
+            .unwrap();
+        let actual = state.logits().unwrap();
+        assert_eq!(actual.dims(), &[1, tokens.len()]);
+        let error = actual
+            .sub(&expected)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(error < 1e-5, "control projection error: {error}");
+        let negative = model.prefill(&input, false).unwrap();
+        assert!(negative.logits().is_err());
+        assert_eq!(negative.last_hidden().dims(), &[1, config.hidden_size]);
     }
 }

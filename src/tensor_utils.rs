@@ -166,16 +166,12 @@ pub fn cpu_flash_attention(
     }
 
     let q = q.transpose(1, 2)?.contiguous()?;
-    let k = k.transpose(1, 2)?.contiguous()?;
-    let v = v.transpose(1, 2)?.contiguous()?;
+    // Candle's CPU kernel reads KV strides directly. Capacity-backed cache
+    // prefixes need not be copied into a freshly packed allocation each step.
+    let k = k.transpose(1, 2)?;
+    let v = v.transpose(1, 2)?;
     let attn = candle_nn::cpu_flash_attention::run_flash_attn_cpu::<f32>(
-        &q,
-        &k,
-        &v,
-        mask,
-        scale,
-        None,
-        None,
+        &q, &k, &v, mask, scale, None, None,
     )?;
     Ok(Some(attn))
 }
@@ -199,6 +195,32 @@ pub fn snake_beta(x: &Tensor, alpha: &Tensor, beta: &Tensor) -> Result<Tensor> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cpu_attention_accepts_strided_multi_batch_cache() -> Result<()> {
+        let device = Device::Cpu;
+        for q_len in [1, 3] {
+            let q = Tensor::arange(0f32, (2 * 2 * q_len * 8) as f32, &device)?
+                .reshape((2, 2, q_len, 8))?
+                .affine(0.01, -0.2)?;
+            let storage = Tensor::arange(0f32, (2 * 16 * 2 * 8) as f32, &device)?
+                .reshape((2, 16, 2, 8))?
+                .affine(0.003, -0.1)?;
+            let k = storage.narrow(1, 0, 5)?.transpose(1, 2)?;
+            let v = storage.affine(0.3, 0.2)?.narrow(1, 0, 5)?.transpose(1, 2)?;
+            let actual = cpu_flash_attention(&q, &k, &v, None, 0.3535534)?.unwrap();
+            let weights = q
+                .matmul(&k.transpose(2, 3)?.contiguous()?)?
+                .affine(0.3535534, 0.)?;
+            let expected = candle_nn::ops::softmax_last_dim(&weights)?.matmul(&v.contiguous()?)?;
+            let error = (&actual - &expected)?
+                .abs()?
+                .max_all()?
+                .to_scalar::<f32>()?;
+            assert!(error < 1e-5, "strided attention error {error}");
+        }
+        Ok(())
+    }
 
     #[test]
     fn test_cpu_flash_attention_shape_policy() {

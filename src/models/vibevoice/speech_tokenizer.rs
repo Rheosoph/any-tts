@@ -4,6 +4,24 @@ use candle_nn::{Linear, Module, VarBuilder};
 use super::config::VibeVoiceTokenizerConfig;
 use crate::layers::conv::{Conv1d, ConvTranspose1d};
 
+/// Per-request causal codec history. Each entry retains only its layer's
+/// receptive field, rather than the audio/latent prefix.
+#[derive(Default, Clone)]
+pub(crate) struct TokenizerStreamState {
+    buffers: Vec<Option<Tensor>>,
+}
+
+impl TokenizerStreamState {
+    fn next(&mut self, index: &mut usize) -> &mut Option<Tensor> {
+        if self.buffers.len() <= *index {
+            self.buffers.push(None);
+        }
+        let buffer = &mut self.buffers[*index];
+        *index += 1;
+        buffer
+    }
+}
+
 struct ConvRmsNorm {
     weight: Option<Tensor>,
     eps: f64,
@@ -88,6 +106,31 @@ impl SConv1d {
         let x = pad1d_constant(x, padding_left, padding_right)?;
         self.conv.forward(&x)
     }
+
+    fn forward_stream(&self, x: &Tensor, history: &mut Option<Tensor>) -> Result<Tensor> {
+        if !self.causal {
+            candle_core::bail!("Incremental tokenization requires causal convolutions")
+        }
+        // Strided stages consume complete strides only. The encoder entry point
+        // accepts chunks aligned to the complete codec hop so no padding from a
+        // temporary chunk boundary is mistaken for real future input.
+        if x.dim(2)? % self.stride != 0 {
+            candle_core::bail!("Incremental codec chunk must be aligned to its stride")
+        }
+        let context = (self.kernel_size - 1) * self.dilation - (self.stride - 1);
+        let joined = match history.as_ref() {
+            Some(previous) => Tensor::cat(&[previous, x], 2)?,
+            None => pad1d_constant(x, context, 0)?,
+        };
+        let output = self.conv.forward(&joined)?;
+        // copy releases the larger temporary allocation after each step.
+        *history = Some(
+            joined
+                .narrow(2, joined.dim(2)? - context, context)?
+                .copy()?,
+        );
+        Ok(output)
+    }
 }
 
 struct SConvTranspose1d {
@@ -141,6 +184,28 @@ impl SConvTranspose1d {
         };
         y = unpad1d(&y, padding_left, padding_right)?;
         Ok(y)
+    }
+
+    fn forward_stream(&self, x: &Tensor, history: &mut Option<Tensor>) -> Result<Tensor> {
+        if !self.causal {
+            candle_core::bail!("Incremental tokenization requires causal convolutions")
+        }
+        // Re-evaluate only the input frames whose kernels overlap the new
+        // output. This also applies the bias exactly once at chunk boundaries.
+        let previous_len = history.as_ref().map_or(0, |value| value.dims()[2]);
+        let joined = match history.as_ref() {
+            Some(previous) => Tensor::cat(&[previous, x], 2)?,
+            None => x.clone(),
+        };
+        let output = self.forward(&joined)?.narrow(
+            2,
+            previous_len * self.stride,
+            x.dim(2)? * self.stride,
+        )?;
+        let context = (self.kernel_size - self.stride).div_ceil(self.stride);
+        let keep = context.min(joined.dim(2)?);
+        *history = Some(joined.narrow(2, joined.dim(2)? - keep, keep)?.copy()?);
+        Ok(output)
     }
 }
 
@@ -223,6 +288,16 @@ impl Block1d {
         let residual = x;
         let mut h = self.norm.forward(x)?;
         h = self.mixer.forward(&h)?;
+        self.finish_forward(residual, h)
+    }
+
+    fn forward_stream(&self, x: &Tensor, history: &mut Option<Tensor>) -> Result<Tensor> {
+        let h = self.norm.forward(x)?;
+        let h = self.mixer.forward_stream(&h, history)?;
+        self.finish_forward(x, h)
+    }
+
+    fn finish_forward(&self, residual: &Tensor, mut h: Tensor) -> Result<Tensor> {
         if let Some(gamma) = &self.gamma {
             h = h.broadcast_mul(&gamma.unsqueeze(0)?.unsqueeze(2)?)?;
         }
@@ -340,6 +415,21 @@ impl TokenizerEncoder {
         }
         self.head.forward(&h)
     }
+
+    fn forward_stream(&self, x: &Tensor, state: &mut TokenizerStreamState) -> Result<Tensor> {
+        let mut index = 0;
+        let mut h = x.clone();
+        for (downsample, stage) in self.downsample_layers.iter().zip(&self.stages) {
+            h = downsample.forward_stream(&h, state.next(&mut index))?;
+            for block in stage {
+                h = block.forward_stream(&h, state.next(&mut index))?;
+            }
+        }
+        if let Some(norm) = &self.norm {
+            h = norm.forward(&h)?;
+        }
+        self.head.forward_stream(&h, state.next(&mut index))
+    }
 }
 
 struct DecoderLayer {
@@ -356,6 +446,13 @@ impl DecoderLayer {
         match &self.kind {
             DecoderLayerKind::Conv(layer) => layer.forward(x),
             DecoderLayerKind::ConvTranspose(layer) => layer.forward(x),
+        }
+    }
+
+    fn forward_stream(&self, x: &Tensor, history: &mut Option<Tensor>) -> Result<Tensor> {
+        match &self.kind {
+            DecoderLayerKind::Conv(layer) => layer.forward_stream(x, history),
+            DecoderLayerKind::ConvTranspose(layer) => layer.forward_stream(x, history),
         }
     }
 }
@@ -462,6 +559,21 @@ impl TokenizerDecoder {
         }
         self.head.forward(&h)
     }
+
+    fn forward_stream(&self, x: &Tensor, state: &mut TokenizerStreamState) -> Result<Tensor> {
+        let mut index = 0;
+        let mut h = x.clone();
+        for (upsample, stage) in self.upsample_layers.iter().zip(&self.stages) {
+            h = upsample.forward_stream(&h, state.next(&mut index))?;
+            for block in stage {
+                h = block.forward_stream(&h, state.next(&mut index))?;
+            }
+        }
+        if let Some(norm) = &self.norm {
+            h = norm.forward(&h)?;
+        }
+        self.head.forward_stream(&h, state.next(&mut index))
+    }
 }
 
 #[derive(Clone)]
@@ -519,6 +631,19 @@ impl VibeVoiceAcousticTokenizer {
         };
         self.decoder.forward(&latents)
     }
+
+    /// Decode new latents in explicit [batch, frames, latent_dim] layout.
+    pub(crate) fn decode_stream(
+        &self,
+        latents: &Tensor,
+        state: &mut TokenizerStreamState,
+    ) -> Result<Tensor> {
+        if !self.config.causal {
+            candle_core::bail!("Incremental acoustic decoding requires a causal tokenizer")
+        }
+        self.decoder
+            .forward_stream(&latents.transpose(1, 2)?, state)
+    }
 }
 
 pub struct VibeVoiceSemanticTokenizer {
@@ -541,6 +666,22 @@ impl VibeVoiceSemanticTokenizer {
 
     pub fn encode(&self, audio: &Tensor) -> Result<VibeVoiceTokenizerEncoderOutput> {
         let latents = self.encoder.forward(audio)?;
+        Ok(VibeVoiceTokenizerEncoderOutput {
+            mean: latents.transpose(1, 2)?,
+            std: None,
+        })
+    }
+
+    pub(crate) fn encode_stream(
+        &self,
+        audio: &Tensor,
+        state: &mut TokenizerStreamState,
+    ) -> Result<VibeVoiceTokenizerEncoderOutput> {
+        let hop = self.config.encoder_ratios.iter().product::<usize>();
+        if !self.config.causal || hop == 0 || audio.dim(2)? == 0 || audio.dim(2)? % hop != 0 {
+            candle_core::bail!("Incremental semantic encoding requires causal, hop-aligned audio")
+        }
+        let latents = self.encoder.forward_stream(audio, state)?;
         Ok(VibeVoiceTokenizerEncoderOutput {
             mean: latents.transpose(1, 2)?,
             std: None,
@@ -591,4 +732,167 @@ fn unpad1d(x: &Tensor, left: usize, right: usize) -> Result<Tensor> {
     let total = x.dim(2)?;
     let keep = total.saturating_sub(left + right);
     x.narrow(2, left, keep)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::{DType, Device, Shape};
+    use candle_nn::var_builder::SimpleBackend;
+
+    struct SyntheticWeights;
+
+    impl SimpleBackend for SyntheticWeights {
+        fn get(
+            &self,
+            shape: Shape,
+            name: &str,
+            _hint: candle_nn::Init,
+            dtype: DType,
+            device: &Device,
+        ) -> Result<Tensor> {
+            let norm = name.ends_with("norm.weight") || name.ends_with("gamma");
+            let salt = name
+                .bytes()
+                .fold(0usize, |acc, byte| acc.wrapping_add(byte as usize));
+            let values: Vec<f32> = (0..shape.elem_count())
+                .map(|index| {
+                    if norm {
+                        1.0
+                    } else {
+                        ((index * 7 + salt) % 29) as f32 / 100.0 - 0.14
+                    }
+                })
+                .collect();
+            Tensor::from_vec(values, shape, device)?.to_dtype(dtype)
+        }
+
+        fn get_unchecked(&self, _name: &str, _dtype: DType, _device: &Device) -> Result<Tensor> {
+            candle_core::bail!("Synthetic weights require a shape")
+        }
+
+        fn contains_tensor(&self, _name: &str) -> bool {
+            true
+        }
+    }
+
+    fn config(bias: bool) -> VibeVoiceTokenizerConfig {
+        VibeVoiceTokenizerConfig {
+            vae_dim: 3,
+            channels: 1,
+            causal: true,
+            encoder_n_filters: 2,
+            decoder_n_filters: 2,
+            encoder_ratios: vec![2, 3],
+            encoder_depths: "1-1-1".to_string(),
+            conv_bias: bias,
+            disable_last_norm: false,
+            ..Default::default()
+        }
+    }
+
+    fn assert_close(actual: &Tensor, expected: &Tensor) {
+        assert_eq!(actual.dims(), expected.dims());
+        let error = actual
+            .sub(expected)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(error < 2e-5, "maximum codec error: {error}");
+    }
+
+    #[test]
+    fn incremental_acoustic_and_semantic_codecs_match_every_full_prefix() {
+        for bias in [false, true] {
+            let device = Device::Cpu;
+            let config = config(bias);
+            let vb =
+                VarBuilder::from_backend(Box::new(SyntheticWeights), DType::F32, device.clone());
+            let acoustic =
+                VibeVoiceAcousticTokenizer::load_decoder_only(&config, vb.pp("acoustic")).unwrap();
+            let semantic = VibeVoiceSemanticTokenizer::load(&config, vb.pp("semantic")).unwrap();
+            let latents = Tensor::from_vec(
+                (0..27)
+                    .map(|index| (index as f32 * 0.31).sin())
+                    .collect::<Vec<_>>(),
+                (1, 9, 3),
+                &device,
+            )
+            .unwrap();
+            let mut decoder_state = TokenizerStreamState::default();
+            let mut encoder_state = TokenizerStreamState::default();
+            let mut audio_chunks = Vec::new();
+            let mut semantic_chunks = Vec::new();
+            let mut position = 0;
+            let mut retained = None;
+            for chunk_len in [1, 2, 1, 3, 2] {
+                let audio = acoustic
+                    .decode_stream(
+                        &latents.narrow(1, position, chunk_len).unwrap(),
+                        &mut decoder_state,
+                    )
+                    .unwrap();
+                semantic_chunks.push(
+                    semantic
+                        .encode_stream(&audio, &mut encoder_state)
+                        .unwrap()
+                        .mean,
+                );
+                audio_chunks.push(audio);
+                position += chunk_len;
+                let prefix_audio = acoustic
+                    .decode(
+                        &latents
+                            .narrow(1, 0, position)
+                            .unwrap()
+                            .transpose(1, 2)
+                            .unwrap(),
+                    )
+                    .unwrap();
+                assert_close(&Tensor::cat(&audio_chunks, 2).unwrap(), &prefix_audio);
+                assert_close(
+                    &Tensor::cat(&semantic_chunks, 1).unwrap(),
+                    &semantic.encode(&prefix_audio).unwrap().mean,
+                );
+                let buffer_size: usize = decoder_state
+                    .buffers
+                    .iter()
+                    .chain(&encoder_state.buffers)
+                    .filter_map(Option::as_ref)
+                    .map(Tensor::elem_count)
+                    .sum();
+                if let Some(previous) = retained {
+                    assert_eq!(buffer_size, previous, "stream state must remain bounded");
+                }
+                retained = Some(buffer_size);
+            }
+            let energy: f32 = Tensor::cat(&audio_chunks, 2)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .iter()
+                .map(|value| value.abs())
+                .sum();
+            assert!(energy > 0.01, "parity test must exercise nonzero audio");
+        }
+    }
+
+    #[test]
+    fn incremental_semantic_encoder_rejects_partial_hops_before_changing_state() {
+        let device = Device::Cpu;
+        let vb = VarBuilder::from_backend(Box::new(SyntheticWeights), DType::F32, device.clone());
+        let semantic = VibeVoiceSemanticTokenizer::load(&config(true), vb).unwrap();
+        let mut state = TokenizerStreamState::default();
+        let audio = Tensor::zeros((1, 1, 5), DType::F32, &device).unwrap();
+        assert!(semantic.encode_stream(&audio, &mut state).is_err());
+        assert!(state.buffers.is_empty());
+    }
 }

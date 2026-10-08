@@ -7,6 +7,10 @@ use any_tts::traits::TtsModel;
 use any_tts::{ModelType, SynthesisRequest, TtsConfig};
 
 #[test]
+#[cfg_attr(
+    feature = "download",
+    ignore = "Missing-path fallback can download weights; run without the download feature"
+)]
 fn test_qwen3tts_load_missing_path() {
     let config = TtsConfig::new(ModelType::Qwen3Tts);
     let result = Qwen3TtsModel::load(config);

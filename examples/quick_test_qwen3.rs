@@ -21,7 +21,7 @@ fn main() {
 
         let template = "<|im_start|>assistant\nHello.<|im_end|>\n<|im_start|>assistant\n";
         let ids = tok.encode(template).unwrap();
-        println!("Template tokens ({} total): {:?}", ids.len(), &ids);
+        println!("Template tokens ({} total): {:?}", ids.len(), ids);
         println!("First 3 (role): {:?}", &ids[..3.min(ids.len())]);
         if ids.len() > 8 {
             println!("Text content [3..-5]: {:?}", &ids[3..ids.len() - 5]);

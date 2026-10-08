@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use candle_core::{Device, Tensor};
 
 use crate::error::TtsError;
-use crate::mel::resample_linear;
+use crate::mel::resample_audio;
 use crate::tokenizer::TextTokenizer;
 use crate::traits::{ReferenceAudio, SynthesisRequest};
 
@@ -171,7 +171,7 @@ impl VibeVoiceProcessor {
         let mut tokens = self.tokenizer.encode(" Voice input:\n")?;
         let mut masks = vec![false; tokens.len()];
         let prefix_tokens = self.tokenizer.encode(" Speaker 0:")?;
-        let normalized_audio = self.normalize_reference_audio(reference_audio);
+        let normalized_audio = self.normalize_reference_audio(reference_audio)?;
         let vae_len = normalized_audio
             .len()
             .div_ceil(self.config.speech_tok_compress_ratio);
@@ -236,26 +236,22 @@ impl VibeVoiceProcessor {
         })
     }
 
-    pub fn normalize_reference_audio(&self, audio: &ReferenceAudio) -> Vec<f32> {
-        let resampled = if audio.sample_rate != self.config.audio_processor.sampling_rate {
-            resample_linear(
-                &audio.samples,
-                audio.sample_rate,
-                self.config.audio_processor.sampling_rate,
-            )
-        } else {
-            audio.samples.clone()
-        };
+    pub fn normalize_reference_audio(&self, audio: &ReferenceAudio) -> Result<Vec<f32>, TtsError> {
+        let resampled = resample_audio(
+            &audio.samples,
+            audio.sample_rate,
+            self.config.audio_processor.sampling_rate,
+        )?;
 
         if !self.config.db_normalize {
-            return resampled;
+            return Ok(resampled);
         }
 
-        normalize_dbfs(
+        Ok(normalize_dbfs(
             &resampled,
             self.config.audio_processor.target_d_b_fs,
             self.config.audio_processor.eps,
-        )
+        ))
     }
 
     pub fn parse_script(&self, script: &str) -> Vec<ParsedScriptLine> {

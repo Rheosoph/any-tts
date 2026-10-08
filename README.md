@@ -35,7 +35,7 @@ For Flow-like specifically: every public backend can now load from relative-path
 - Native Rust backends across the public model surface.
 - Local path loading, in-memory byte bundles, per-file wiring, or Hugging Face fallback.
 - GPU first when available through CUDA or Metal, with CPU fallback and optional Accelerate support for Apple CPU builds.
-- Request-level control for `language`, `voice`, `reference_audio`, `instruct`, `max_tokens`, `temperature`, and `cfg_scale`.
+- Request-level control for `language`, `voice`, `reference_audio`, `instruct`, `max_tokens`, `temperature`, `speed`, and `cfg_scale`.
 - WAV output everywhere, with built-in WAV and MP3 input decoding for cleanup and reference-audio workflows.
 
 ## Supported TTS models
@@ -65,6 +65,15 @@ All six models above are exposed through the public `ModelType` enum and `load_m
 ## Installation
 
 For CPU-only builds, a recent stable Rust toolchain is enough. For GPU builds, compile the feature set that matches your machine. Kokoro no longer requires a system `espeak-ng` install: the repo now ships an in-tree pure-Rust phonemizer with an `espeak-rs`-compatible interface for the language set exposed by the current Kokoro backend.
+
+English phonemization preserves sentence context and Kokoro's trained phoneme
+symbols, with separate American and British dictionaries. Unknown words use a
+bounded, cached Rust fallback; no external executable or runtime download is
+used. Numbers, decimals, currencies and percentages are normalized before
+non-English sentence splitting. Non-English pronunciation still uses the
+in-tree rule frontend; it does not promise complete native eSpeak parity.
+Embedded G2P sources and dictionaries retain their upstream licenses and pinned
+provenance in [`src/models/kokoro/g2p/NOTICE`](src/models/kokoro/g2p/NOTICE).
 
 Add the crate from crates.io:
 
@@ -232,9 +241,67 @@ Using these exact relative paths makes the byte-based API foolproof because the 
 | `instruct` | Natural-language style control | Most useful on OmniVoice and Qwen3. |
 | `max_tokens` | Upper bound on generated codec/audio tokens | Helpful for latency testing and smoke tests. |
 | `temperature` | Sampling temperature | Supported where the backend uses it. |
+| `speed` | Speaking-rate multiplier | Kokoro only; finite values from `0.1` through `5.0`, default `1.0`. |
 | `cfg_scale` | Classifier-free guidance scale | Used by OmniVoice and other backends that expose CFG-like control. |
 | `reference_audio` | Reference clip for voice cloning or prompt conditioning | Used by backends such as VibeVoice when conditioning from speech; unsupported backends return an explicit error. |
 | `voice_embedding` | Precomputed embedding payload | Currently reusable with backends that accept embeddings directly. |
+
+Kokoro callers that previously used `with_temperature()` to change speaking
+rate should switch to `with_speed()`. Temperature no longer changes Kokoro's
+duration prediction. Other backends explicitly reject `speed` requests.
+
+## Incremental audio
+
+`TtsModel::synthesize_stream()` delivers consecutive PCM chunks through a
+synchronous callback. Kokoro splits long inputs at phoneme-counted sentence,
+clause or word boundaries, keeping each chunk within the encoder context.
+VibeVoice Realtime emits audio as speech latents are generated using a stateful
+causal decoder. `synthesize()` collects the same chunks into one `AudioSamples`.
+
+```rust,no_run
+use any_tts::{load_model, ModelType, SynthesisRequest, TtsConfig};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let model = load_model(
+        TtsConfig::new(ModelType::Kokoro).with_model_path("./models/Kokoro-82M")
+    )?;
+    let request = SynthesisRequest::new("Your text here.").with_speed(1.1);
+    model.synthesize_stream(&request, &mut |chunk| {
+        // Send chunk.samples to your playback device or network stream here.
+        println!("{} samples at {} Hz", chunk.samples.len(), chunk.sample_rate);
+        Ok(())
+    })?;
+    Ok(())
+}
+```
+
+The callback provides backpressure; returning an error stops generation before
+the next chunk. Delivered chunks contain no repeated overlap. Check
+`supports_streaming()` before relying on early output: other backends and
+noncausal Realtime codec configurations deliver a complete buffered chunk.
+Realtime's `max_tokens` limits newly generated speech tokens; text conditioning
+and cached prompts consume context capacity but do not consume this budget.
+
+## Measuring latency
+
+Use a release build and local model assets:
+
+```bash
+cargo run --release --example benchmark_tts -- \
+  --model kokoro --model-path ./models/Kokoro-82M --device cpu --iterations 5
+```
+
+The JSON report records model loading, the first synthesis, warm median/p95
+latency, time to first audio, audio duration and real-time factor. For Kokoro it
+also measures cold and warm phonemization separately; this initializes the G2P
+dictionaries before the synthesis measurements. Add `--phonemizer-only` to
+benchmark text processing using just the model's `config.json`. Use `--text`,
+`--language`, `--voice`, `--temperature`, `--speed`, and `--max-tokens` to hold the workload
+constant. Compare short and long utterances and listen to generated audio when
+evaluating performance changes.
+
+Applications can move dictionary initialization out of their first request with
+`any_tts::models::kokoro::phonemizer::prewarm("en")?` (or `"en-gb"` / `"ja"`).
 
 ## Examples in this repo
 
@@ -276,7 +343,8 @@ Kokoro is the compact option in this repo: an 82M-parameter StyleTTS2 plus ISTFT
 - Native Rust inference.
 - Default output at 24 kHz.
 - Named preset voices discovered from the `voices/` directory.
-- Language tags exposed by the current backend: `en`, `ja`, `zh`, `ko`, `fr`, `de`, `it`, `pt`, `es`, `hi`.
+- Language tags exposed by the current backend: `en`, `en-gb`, `ja`, `zh`, `ko`, `fr`, `de`, `it`, `pt`, `es`, `hi`.
+- Long-input chunking and callback streaming within the model's context limit.
 - Optional voice-cloning support only when a checkpoint includes style-encoder weights.
 
 **Pros**
@@ -288,7 +356,7 @@ Kokoro is the compact option in this repo: an 82M-parameter StyleTTS2 plus ISTFT
 
 **Cons**
 
-- Uses a pure-Rust phonemizer for English input, so deployment is simpler than the previous espeak-based setup.
+- Non-English pronunciation uses a rule frontend whose parity tuning is ongoing.
 - The common open release is mostly about preset voice packs, not raw zero-shot cloning.
 - Less expressive control than the bigger instruct-heavy model families.
 
@@ -435,6 +503,7 @@ VibeVoice Realtime is the smaller low-latency VibeVoice variant. In this crate i
 - Public example coverage through `generate_vibevoice_realtime`.
 - 24 kHz output with the same Candle runtime selection flow used by the rest of the crate.
 - Voice selection through `SynthesisRequest::with_voice()` when matching preset files are present.
+- Incremental PCM output through `synthesize_stream()` with causal codec checkpoints.
 
 **What does not work yet in the Rust backend**
 

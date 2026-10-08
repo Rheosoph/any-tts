@@ -130,6 +130,7 @@ fn pseudo_random_unit(seed: u64) -> f32 {
     ((value >> 40) as u32 as f32) / ((1u32 << 24) as f32)
 }
 
+#[cfg(test)]
 fn stft_frame(frame: &[f32], freq_bins: usize) -> (Vec<f32>, Vec<f32>) {
     let n_fft = frame.len();
     let mut magnitude = vec![0.0; freq_bins];
@@ -150,6 +151,7 @@ fn stft_frame(frame: &[f32], freq_bins: usize) -> (Vec<f32>, Vec<f32>) {
     (magnitude, phase)
 }
 
+#[cfg(test)]
 fn istft_frame(magnitude: &[f32], phase: &[f32], n_fft: usize) -> Vec<f32> {
     let mut real = vec![0.0f32; n_fft];
     let mut imag = vec![0.0f32; n_fft];
@@ -348,19 +350,22 @@ impl SineGen {
     fn forward(&self, f0: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
         let device = f0.device().clone();
         let dtype = f0.dtype();
-        let (batch, length, _) = f0.dims3()?;
+        let (batch, length, channels) = f0.dims3()?;
+        if channels != 1 || length == 0 || self.upsample_scale == 0 {
+            candle_core::bail!(
+                "Sine source expects nonempty F0 with one channel and a positive upsample scale"
+            );
+        }
         let harmonic_dim = self.harmonic_num + 1;
         let coarse_len = std::cmp::max(1, length / self.upsample_scale);
 
-        let f0_cpu = f0.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
-        let f0_data: Vec<Vec<Vec<f32>>> = f0_cpu.to_vec3()?;
+        let f0_data = f0.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
 
-        let mut sine_values = Vec::with_capacity(batch * length * harmonic_dim);
+        let mut sine_values = vec![0.0f32; batch * length * harmonic_dim];
         let mut uv_values: Vec<f32> = Vec::with_capacity(batch * length);
 
-        for (batch_index, batch_f0) in f0_data.iter().enumerate() {
-            let fundamental: Vec<f32> = batch_f0.iter().map(|step| step[0]).collect();
-            for &value in &fundamental {
+        for (batch_index, fundamental) in f0_data.chunks_exact(length).enumerate() {
+            for &value in fundamental {
                 uv_values.push(if value > self.voiced_threshold {
                     1.0f32
                 } else {
@@ -368,8 +373,7 @@ impl SineGen {
                 });
             }
 
-            let mut phase_per_harmonic = vec![vec![0.0f32; length]; harmonic_dim];
-            for (harmonic, phase_values) in phase_per_harmonic.iter_mut().enumerate() {
+            for harmonic in 0..harmonic_dim {
                 let harmonic_scale = (harmonic + 1) as f32;
                 let mut rad_values: Vec<f32> = fundamental
                     .iter()
@@ -392,26 +396,17 @@ impl SineGen {
                     .iter()
                     .map(|value| *value * self.upsample_scale as f32)
                     .collect();
-                *phase_values = linear_resample_1d(&scaled_phase, length);
-            }
-
-            for time_index in 0..length {
-                sine_values.extend(
-                    phase_per_harmonic
-                        .iter()
-                        .map(|phase_values| phase_values[time_index].sin() * self.sine_amp),
-                );
+                let phases = linear_resample_1d(&scaled_phase, length);
+                for (time_index, phase) in phases.into_iter().enumerate() {
+                    sine_values[(batch_index * length + time_index) * harmonic_dim + harmonic] =
+                        phase.sin() * self.sine_amp;
+                }
             }
         }
 
-        let pure_sines = Tensor::new(sine_values.as_slice(), &Device::Cpu)?
-            .reshape((batch, length, harmonic_dim))?
-            .to_device(&device)?
+        let pure_sines = Tensor::from_vec(sine_values, (batch, length, harmonic_dim), &device)?
             .to_dtype(dtype)?;
-        let uv = Tensor::new(uv_values.as_slice(), &Device::Cpu)?
-            .reshape((batch, length, 1))?
-            .to_device(&device)?
-            .to_dtype(dtype)?;
+        let uv = Tensor::from_vec(uv_values, (batch, length, 1), &device)?.to_dtype(dtype)?;
 
         let noise_amp_voiced = scalar_like(&uv, self.noise_std)?.broadcast_as(uv.shape())?;
         let noise_amp_unvoiced = scalar_like(&uv, self.sine_amp / 3.0)?.broadcast_as(uv.shape())?;
@@ -467,43 +462,30 @@ impl SourceModule {
         })
     }
 
-    /// Forward: F0 → (sine_source, noise_source, uv)
-    fn forward(&self, f0: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
-        let (sine_wavs, uv, _) = self.sine_gen.forward(f0)?;
-
-        // Linear merge harmonics: [batch, length, harmonics+1] → [batch, length, 1]
-        // Unsqueeze weight to 3D for batched matmul: [1, harmonics+1] → [1, harmonics+1, 1]
+    /// Merge noisy harmonic excitation into a single source channel.
+    fn forward(&self, f0: &Tensor) -> Result<Tensor> {
+        let (sine_wavs, _, _) = self.sine_gen.forward(f0)?;
         let w_t = self.l_linear_weight.t()?.unsqueeze(0)?;
         let sine_merge = sine_wavs.matmul(&w_t)?;
-        if let Some(ref bias) = self.l_linear_bias {
-            let sine_merge = sine_merge.broadcast_add(&bias.unsqueeze(0)?.unsqueeze(0)?)?;
-            let sine_merge = sine_merge.tanh()?;
-            let noise = scale_tensor(
-                &Tensor::randn(0f32, 1f32, uv.shape(), f0.device())?,
-                0.1f32 / 3.0f32,
-            )?;
-            Ok((sine_merge, noise, uv))
-        } else {
-            let sine_merge = sine_merge.tanh()?;
-            let noise = scale_tensor(
-                &Tensor::randn(0f32, 1f32, uv.shape(), f0.device())?,
-                0.1f32 / 3.0f32,
-            )?;
-            Ok((sine_merge, noise, uv))
-        }
+        let sine_merge = match &self.l_linear_bias {
+            Some(bias) => sine_merge.broadcast_add(&bias.unsqueeze(0)?.unsqueeze(0)?)?,
+            None => sine_merge,
+        };
+        sine_merge.tanh()
     }
 }
 
 // ---------------------------------------------------------------------------
-// STFT (conv-based) for harmonic processing
+// Cached Fourier transforms for harmonic processing
 // ---------------------------------------------------------------------------
 
-/// Conv-based STFT for processing harmonic source signals.
+/// Small-window STFT with cached trigonometric bases and reusable frame buffers.
 struct ConvStft {
     filter_length: usize,
     hop_length: usize,
-    _freq_bins: usize,
     window: Vec<f32>,
+    cos_basis: Vec<f32>,
+    sin_basis: Vec<f32>,
 }
 
 impl ConvStft {
@@ -513,129 +495,158 @@ impl ConvStft {
         _device: &Device,
         _dtype: candle_core::DType,
     ) -> Result<Self> {
-        let freq_bins = filter_length / 2 + 1;
-
+        if filter_length < 2 || filter_length % 2 != 0 || hop_length == 0 {
+            candle_core::bail!("STFT requires an even filter length >= 2 and a positive hop");
+        }
         let window = (0..filter_length)
             .map(|n| {
                 0.5 * (1.0 - (2.0 * std::f32::consts::PI * n as f32 / filter_length as f32).cos())
             })
             .collect();
-
+        let mut cos_basis = Vec::with_capacity(filter_length * filter_length);
+        let mut sin_basis = Vec::with_capacity(filter_length * filter_length);
+        for k in 0..filter_length {
+            for n in 0..filter_length {
+                let angle = 2.0 * std::f32::consts::PI * k as f32 * n as f32 / filter_length as f32;
+                cos_basis.push(angle.cos());
+                sin_basis.push(angle.sin());
+            }
+        }
         Ok(Self {
             filter_length,
             hop_length,
-            _freq_bins: freq_bins,
             window,
+            cos_basis,
+            sin_basis,
         })
     }
 
-    /// Forward STFT: waveform → (magnitude, phase)
-    ///
-    /// `waveform`: [batch, length] or [batch, 1, length]
+    /// Forward STFT: waveform → (magnitude, phase), on the input device.
     fn transform(&self, waveform: &Tensor) -> Result<(Tensor, Tensor)> {
-        let pad_len = self.filter_length / 2;
-        let device = waveform.device().clone();
+        let device = waveform.device();
         let dtype = waveform.dtype();
-
-        let waveform = if waveform.dims().len() == 3 {
+        let waveform = if waveform.rank() == 3 {
             waveform.squeeze(1)?
         } else {
             waveform.clone()
         };
-
-        let waveform = waveform.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
-        let waveform_data: Vec<Vec<f32>> = waveform.to_vec2()?;
-        let batch = waveform_data.len();
+        let (batch, length) = waveform.dims2()?;
+        let pad = self.filter_length / 2;
+        if length <= pad || batch == 0 {
+            candle_core::bail!(
+                "STFT waveform must have a nonempty batch and more than {pad} samples"
+            );
+        }
+        let waveform_data = waveform
+            .flatten_all()?
+            .to_dtype(DType::F32)?
+            .to_vec1::<f32>()?;
+        let frames = 1 + length / self.hop_length;
         let freq_bins = self.filter_length / 2 + 1;
-        let mut magnitude_data = Vec::new();
-        let mut phase_data = Vec::new();
-        let mut frame_count = 0;
-
-        for samples in &waveform_data {
-            let padded = reflect_pad_1d(samples, pad_len);
-            let frames = 1 + (padded.len() - self.filter_length) / self.hop_length;
-            frame_count = frames;
-            for frame_idx in 0..frames {
-                let offset = frame_idx * self.hop_length;
-                let mut frame = vec![0.0f32; self.filter_length];
-                for sample_idx in 0..self.filter_length {
-                    frame[sample_idx] = padded[offset + sample_idx] * self.window[sample_idx];
+        let mut magnitude = vec![0.0f32; batch * freq_bins * frames];
+        let mut phase = vec![0.0f32; magnitude.len()];
+        let mut frame = vec![0.0f32; self.filter_length];
+        for (batch_index, samples) in waveform_data.chunks_exact(length).enumerate() {
+            let padded = reflect_pad_1d(samples, pad);
+            for frame_index in 0..frames {
+                let offset = frame_index * self.hop_length;
+                for (index, value) in frame.iter_mut().enumerate() {
+                    *value = padded[offset + index] * self.window[index];
                 }
-                let (mag, phase) = stft_frame(&frame, freq_bins);
-                magnitude_data.extend_from_slice(&mag);
-                phase_data.extend_from_slice(&phase);
+                for frequency in 0..freq_bins {
+                    let basis_offset = frequency * self.filter_length;
+                    let mut real = 0.0f32;
+                    let mut imag = 0.0f32;
+                    for (index, sample) in frame.iter().enumerate() {
+                        real += sample * self.cos_basis[basis_offset + index];
+                        imag -= sample * self.sin_basis[basis_offset + index];
+                    }
+                    let index = (batch_index * freq_bins + frequency) * frames + frame_index;
+                    magnitude[index] = (real * real + imag * imag).sqrt();
+                    phase[index] = imag.atan2(real);
+                }
             }
         }
-
-        let magnitude = Tensor::new(magnitude_data.as_slice(), &Device::Cpu)?
-            .reshape((batch, frame_count, freq_bins))?
-            .transpose(1, 2)?
-            .to_device(&device)?
-            .to_dtype(dtype)?;
-        let phase = Tensor::new(phase_data.as_slice(), &Device::Cpu)?
-            .reshape((batch, frame_count, freq_bins))?
-            .transpose(1, 2)?
-            .to_device(&device)?
-            .to_dtype(dtype)?;
-
-        Ok((magnitude, phase))
+        let shape = (batch, freq_bins, frames);
+        Ok((
+            Tensor::from_vec(magnitude, shape, device)?.to_dtype(dtype)?,
+            Tensor::from_vec(phase, shape, device)?.to_dtype(dtype)?,
+        ))
     }
 
-    /// Inverse STFT: (magnitude, phase-angle) → waveform
+    /// Final waveform stays on CPU in F32, avoiding a GPU upload/download pair.
     fn inverse(&self, magnitude: &Tensor, phase: &Tensor) -> Result<Tensor> {
-        let device = magnitude.device().clone();
-        let dtype = magnitude.dtype();
-        let magnitude = magnitude.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
-        let phase = phase.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
-        let magnitude_data: Vec<Vec<Vec<f32>>> = magnitude.to_vec3()?;
-        let phase_data: Vec<Vec<Vec<f32>>> = phase.to_vec3()?;
-
-        let pad_len = self.filter_length / 2;
-        let batch = magnitude_data.len();
-        let frames = magnitude.dim(2)?;
-        let padded_len = self.filter_length + self.hop_length * frames.saturating_sub(1);
-        let mut waveform_data = Vec::new();
-
-        for (batch_magnitude, batch_phase) in magnitude_data.iter().zip(phase_data.iter()) {
-            let mut overlap = vec![0.0f32; padded_len];
-            let mut envelope = vec![0.0f32; padded_len];
-            for frame_idx in 0..frames {
-                let mag_frame: Vec<f32> =
-                    batch_magnitude.iter().map(|bin| bin[frame_idx]).collect();
-                let phase_frame: Vec<f32> = batch_phase.iter().map(|bin| bin[frame_idx]).collect();
-                let frame = istft_frame(&mag_frame, &phase_frame, self.filter_length);
-                let offset = frame_idx * self.hop_length;
-                for sample_idx in 0..self.filter_length {
-                    let weighted = frame[sample_idx] * self.window[sample_idx];
-                    overlap[offset + sample_idx] += weighted;
-                    envelope[offset + sample_idx] +=
-                        self.window[sample_idx] * self.window[sample_idx];
-                }
-            }
-
-            for (sample, env) in overlap.iter_mut().zip(envelope.iter()) {
-                if *env > 1e-8 {
-                    *sample /= *env;
-                }
-            }
-
-            let trimmed = if overlap.len() > 2 * pad_len {
-                &overlap[pad_len..overlap.len() - pad_len]
-            } else {
-                overlap.as_slice()
-            };
-            waveform_data.extend_from_slice(trimmed);
+        let (batch, frequencies, frames) = magnitude.dims3()?;
+        if phase.dims() != magnitude.dims()
+            || frequencies != self.filter_length / 2 + 1
+            || frames == 0
+        {
+            candle_core::bail!("Invalid magnitude/phase dimensions for inverse STFT");
         }
-
-        let output_len = if batch == 0 {
-            0
+        let magnitudes = magnitude
+            .flatten_all()?
+            .to_dtype(DType::F32)?
+            .to_vec1::<f32>()?;
+        let phases = phase
+            .flatten_all()?
+            .to_dtype(DType::F32)?
+            .to_vec1::<f32>()?;
+        let pad = self.filter_length / 2;
+        let padded_len = self.filter_length + self.hop_length * (frames - 1);
+        let output_len = if padded_len > 2 * pad {
+            padded_len - 2 * pad
         } else {
-            waveform_data.len() / batch
+            padded_len
         };
-        Tensor::new(waveform_data.as_slice(), &Device::Cpu)?
-            .reshape((batch, 1, output_len))?
-            .to_device(&device)?
-            .to_dtype(dtype)
+        let mut output = Vec::with_capacity(batch * output_len);
+        let mut envelope = vec![0.0f32; padded_len];
+        for frame_index in 0..frames {
+            let offset = frame_index * self.hop_length;
+            for (index, window) in self.window.iter().enumerate() {
+                envelope[offset + index] += window * window;
+            }
+        }
+        let mut real = vec![0.0f32; self.filter_length];
+        let mut imag = vec![0.0f32; self.filter_length];
+        let mut overlap = vec![0.0f32; padded_len];
+        for batch_index in 0..batch {
+            overlap.fill(0.0);
+            for frame_index in 0..frames {
+                for frequency in 0..frequencies {
+                    let index = (batch_index * frequencies + frequency) * frames + frame_index;
+                    let re = magnitudes[index] * phases[index].cos();
+                    let im = magnitudes[index] * phases[index].sin();
+                    real[frequency] = re;
+                    imag[frequency] = im;
+                    if frequency > 0 && frequency < pad {
+                        real[self.filter_length - frequency] = re;
+                        imag[self.filter_length - frequency] = -im;
+                    }
+                }
+                let offset = frame_index * self.hop_length;
+                for index in 0..self.filter_length {
+                    let mut value = 0.0f32;
+                    for frequency in 0..self.filter_length {
+                        let basis_index = frequency * self.filter_length + index;
+                        value += real[frequency] * self.cos_basis[basis_index]
+                            - imag[frequency] * self.sin_basis[basis_index];
+                    }
+                    overlap[offset + index] +=
+                        (value / self.filter_length as f32) * self.window[index];
+                }
+            }
+            for (value, envelope) in overlap.iter_mut().zip(&envelope) {
+                if *envelope > 1e-8 {
+                    *value /= *envelope;
+                }
+            }
+            if padded_len > 2 * pad {
+                output.extend_from_slice(&overlap[pad..padded_len - pad]);
+            } else {
+                output.extend_from_slice(&overlap);
+            }
+        }
+        Tensor::from_vec(output, (batch, 1, output_len), &Device::Cpu)
     }
 }
 
@@ -827,7 +838,7 @@ impl Generator {
         let f0_up = f0_up.transpose(1, 2)?; // [batch, length, 1]
 
         // Generate harmonic source
-        let (har_source, _noi_source, _uv) = self.source_module.forward(&f0_up)?;
+        let har_source = self.source_module.forward(&f0_up)?;
         let har_source = har_source.transpose(1, 2)?.squeeze(1)?; // [batch, length]
 
         // STFT of harmonic source
@@ -981,6 +992,8 @@ impl IstftDecoder {
     /// `f0_curve`: [batch, aligned_len*2] — F0 prediction (upsampled from prosody)
     /// `noise`: [batch, aligned_len*2] — noise prediction
     /// `s`: [batch, style_dim] — style embedding (decoder component)
+    ///
+    /// Returns a CPU F32 waveform, ready for audio sample extraction.
     pub fn forward(
         &self,
         asr: &Tensor,
@@ -1030,7 +1043,95 @@ mod tests {
         let (mag, phase) = stft.transform(&waveform).unwrap();
         assert_eq!(mag.dim(1).unwrap(), 11); // n_fft/2 + 1
         let recon = stft.inverse(&mag, &phase).unwrap();
-        // Reconstructed should have 3 dims: [batch, 1, length]
-        assert!(recon.dims().len() >= 2);
+        assert_eq!(recon.dims(), &[1, 1, 2400]);
+        let error = recon
+            .squeeze(1)
+            .unwrap()
+            .sub(&waveform)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(error < 1e-5, "STFT roundtrip error: {error}");
+    }
+
+    #[test]
+    fn test_cached_stft_matches_original_dft() {
+        let stft = ConvStft::new(20, 5, &Device::Cpu, DType::F32).unwrap();
+        let samples = (0..160)
+            .map(|i| (i as f32 * 0.31).sin())
+            .collect::<Vec<_>>();
+        let waveform = Tensor::from_vec(samples.clone(), (2, 80), &Device::Cpu).unwrap();
+        let (magnitude, phase) = stft.transform(&waveform).unwrap();
+        let magnitude = magnitude.to_vec3::<f32>().unwrap();
+        let phase = phase.to_vec3::<f32>().unwrap();
+        for batch in 0..2 {
+            let padded = reflect_pad_1d(&samples[batch * 80..(batch + 1) * 80], 10);
+            for frame in 0..17 {
+                let values = padded[frame * 5..frame * 5 + 20]
+                    .iter()
+                    .zip(&stft.window)
+                    .map(|(sample, window)| sample * window)
+                    .collect::<Vec<_>>();
+                let (expected_mag, expected_phase) = stft_frame(&values, 11);
+                for frequency in 0..11 {
+                    assert!(
+                        (magnitude[batch][frequency][frame] - expected_mag[frequency]).abs() < 1e-6
+                    );
+                    assert!(
+                        (phase[batch][frequency][frame] - expected_phase[frequency]).abs() < 1e-6
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_cached_inverse_matches_original_dft() {
+        let stft = ConvStft::new(20, 5, &Device::Cpu, DType::F32).unwrap();
+        let magnitude = (0..33)
+            .map(|i| 1.1 + (i as f32 * 0.13).sin())
+            .collect::<Vec<_>>();
+        let phase = (0..33).map(|i| (i as f32 * 0.23).cos()).collect::<Vec<_>>();
+        let mut overlap = [0.0f32; 30];
+        let mut envelope = vec![0.0f32; 30];
+        for frame in 0..3 {
+            let mag = (0..11)
+                .map(|f| magnitude[f * 3 + frame])
+                .collect::<Vec<_>>();
+            let phases = (0..11).map(|f| phase[f * 3 + frame]).collect::<Vec<_>>();
+            let values = istft_frame(&mag, &phases, 20);
+            for index in 0..20 {
+                overlap[frame * 5 + index] += values[index] * stft.window[index];
+                envelope[frame * 5 + index] += stft.window[index] * stft.window[index];
+            }
+        }
+        for (value, envelope) in overlap.iter_mut().zip(envelope) {
+            if envelope > 1e-8 {
+                *value /= envelope;
+            }
+        }
+        let magnitude = Tensor::from_vec(magnitude, (1, 11, 3), &Device::Cpu).unwrap();
+        let phase = Tensor::from_vec(phase, (1, 11, 3), &Device::Cpu).unwrap();
+        let actual = stft
+            .inverse(&magnitude, &phase)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        for (actual, expected) in actual.iter().zip(&overlap[10..20]) {
+            assert!((actual - expected).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn test_stft_short_input_returns_error() {
+        let stft = ConvStft::new(20, 5, &Device::Cpu, DType::F32).unwrap();
+        let input = Tensor::zeros((1, 10), DType::F32, &Device::Cpu).unwrap();
+        assert!(stft.transform(&input).is_err());
     }
 }

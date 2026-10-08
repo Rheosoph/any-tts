@@ -11,11 +11,13 @@ use crate::error::TtsError;
 use crate::models::vibevoice::config::VibeVoicePreprocessorConfig;
 use crate::models::vibevoice::diffusion::{DpmSolverMultistepScheduler, VibeVoiceDiffusionHead};
 use crate::models::vibevoice::generation::{
-    generation_seed, random_normal_tensor, stack_latents, LayerKvCache, SimpleRng,
+    generation_seed, random_normal_tensor, stack_latents, SimpleRng,
 };
 use crate::models::vibevoice::processor::VibeVoiceTokenizerSpec;
 use crate::models::vibevoice::runtime::SpeechConnector;
-use crate::models::vibevoice::speech_tokenizer::VibeVoiceAcousticTokenizer;
+use crate::models::vibevoice::speech_tokenizer::{
+    TokenizerStreamState, VibeVoiceAcousticTokenizer,
+};
 use crate::tokenizer::TextTokenizer;
 use crate::traits::{ModelInfo, SynthesisRequest, TtsModel};
 
@@ -155,45 +157,78 @@ impl TtsModel for VibeVoiceRealtimeModel {
     }
 
     fn synthesize(&self, request: &SynthesisRequest) -> Result<AudioSamples, TtsError> {
+        let mut samples = Vec::new();
+        self.synthesize_stream(request, &mut |chunk| {
+            samples.extend(chunk.samples);
+            Ok(())
+        })?;
+        Ok(AudioSamples::new(samples, self.sample_rate()))
+    }
+
+    fn supports_streaming(&self) -> bool {
+        self.acoustic_tokenizer.config().causal
+    }
+
+    fn synthesize_stream(
+        &self,
+        request: &SynthesisRequest,
+        on_chunk: &mut dyn FnMut(AudioSamples) -> Result<(), TtsError>,
+    ) -> Result<(), TtsError> {
         self.validate_request(request)?;
         let voice_name = resolve_voice_name(request.voice.as_deref(), &self.voice_names)?;
         let preset = self.load_voice_preset(&voice_name)?;
         let text_ids = self.processor.prepare_text(request)?;
-        let prompt_spec = self.processor.tokenizer_spec().clone();
         let mut rng = SimpleRng::new(generation_seed());
         let max_steps = request.max_tokens.unwrap_or_else(|| {
             self.config
                 .decoder_config
                 .max_position_embeddings
-                .saturating_sub(preset.tts_lm.prompt_len)
+                .saturating_sub(preset.tts_lm.state.next_position())
         });
         let cfg_scale = request.cfg_scale.unwrap_or(DEFAULT_CFG_SCALE as f64) as f32;
-        let latents = self.generate_latents(
+        let mut decoder_state = TokenizerStreamState::default();
+        let mut buffered_latents = Vec::new();
+        let streaming = self.supports_streaming();
+        let speech_count = self.generate_latents(
             &preset,
             &text_ids,
-            &prompt_spec,
             cfg_scale,
             max_steps,
             &mut rng,
+            &mut |latent| {
+                if streaming {
+                    let segment = latent.unsqueeze(0)?.unsqueeze(1)?;
+                    let audio = self
+                        .acoustic_tokenizer
+                        .decode_stream(&self.unscale_latents(&segment)?, &mut decoder_state)?;
+                    let samples = audio
+                        .to_dtype(DType::F32)?
+                        .flatten_all()?
+                        .to_vec1::<f32>()?;
+                    on_chunk(AudioSamples::new(samples, self.sample_rate()))
+                } else {
+                    buffered_latents.push(latent.clone());
+                    Ok(())
+                }
+            },
         )?;
-        if latents.is_empty() {
+        if speech_count == 0 {
             return Err(TtsError::ModelError(
                 "VibeVoice Realtime did not produce any speech tokens".to_string(),
             ));
         }
 
-        let segment = stack_latents(&latents)?;
-        let audio = self
-            .acoustic_tokenizer
-            .decode(&self.unscale_latents(&segment)?)?
-            .to_dtype(DType::F32)?
-            .flatten_all()?
-            .to_vec1::<f32>()?;
-
-        Ok(AudioSamples::new(
-            audio,
-            self.preprocessor_config.audio_processor.sampling_rate,
-        ))
+        if !streaming {
+            let segment = stack_latents(&buffered_latents)?;
+            let audio = self
+                .acoustic_tokenizer
+                .decode(&self.unscale_latents(&segment)?.transpose(1, 2)?)?
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            on_chunk(AudioSamples::new(audio, self.sample_rate()))?;
+        }
+        Ok(())
     }
 
     fn sample_rate(&self) -> u32 {
@@ -226,6 +261,11 @@ impl VibeVoiceRealtimeModel {
     }
 
     fn validate_request(&self, request: &SynthesisRequest) -> Result<(), TtsError> {
+        if request.speed.is_some() {
+            return Err(TtsError::ModelError(
+                "VibeVoice Realtime does not support explicit speaking speed".to_string(),
+            ));
+        }
         if request.reference_audio.is_some() {
             return Err(TtsError::ModelError(
                 "VibeVoice Realtime uses cached prompt presets, not reference audio".to_string(),
@@ -283,24 +323,29 @@ impl VibeVoiceRealtimeModel {
         &self,
         preset: &VoicePreset,
         text_ids: &[u32],
-        _tokenizer_spec: &VibeVoiceTokenizerSpec,
         cfg_scale: f32,
         max_steps: usize,
         rng: &mut SimpleRng,
-    ) -> Result<Vec<Tensor>, TtsError> {
+        on_latent: &mut dyn FnMut(&Tensor) -> Result<(), TtsError>,
+    ) -> Result<usize, TtsError> {
         let mut text_index = 0usize;
-        let mut step = preset.tts_lm.prompt_len;
         let mut lm_state = clone_branch_state(&preset.lm.state);
         let mut tts_state = clone_branch_state(&preset.tts_lm.state);
         let mut neg_tts_state = clone_branch_state(&preset.neg_tts_lm.state);
-        let mut latents = Vec::new();
-        let max_positions = self.config.decoder_config.max_position_embeddings;
+        let mut speech_count = 0;
+        let mut budget = GenerationBudget::new(
+            max_steps,
+            self.config.decoder_config.max_position_embeddings,
+        );
 
-        while step < max_steps && step < max_positions {
+        while budget.can_advance(&[tts_state.next_position()]) {
             let remaining_text = text_ids.len().saturating_sub(text_index);
             let text_window = remaining_text.min(TTS_TEXT_WINDOW_SIZE);
             if text_window > 0 {
                 for token_id in &text_ids[text_index..text_index + text_window] {
+                    if !budget.can_advance(&[lm_state.next_position(), tts_state.next_position()]) {
+                        return Ok(speech_count);
+                    }
                     lm_state = self.advance_lm_state(&lm_state, *token_id)?;
                     tts_state = self.advance_tts_state(
                         &tts_state,
@@ -308,28 +353,28 @@ impl VibeVoiceRealtimeModel {
                         &lm_state.last_hidden().clone(),
                         true,
                     )?;
-                    step += 1;
-                    if step >= max_steps || step >= max_positions {
-                        break;
-                    }
                 }
                 text_index += text_window;
             }
 
-            let mut finished = false;
             for _ in 0..TTS_SPEECH_WINDOW_SIZE {
+                if !budget.can_advance(&[tts_state.next_position(), neg_tts_state.next_position()])
+                {
+                    return Ok(speech_count);
+                }
                 let speech_latent = self.sample_speech_token(
                     tts_state.last_hidden(),
                     neg_tts_state.last_hidden(),
                     cfg_scale,
                     rng,
                 )?;
-                latents.push(speech_latent.clone());
+                on_latent(&speech_latent)?;
+                speech_count += 1;
                 let acoustic_embed = self.acoustic_feedback_embedding(&speech_latent)?;
                 tts_state = self.advance_tts_state(&tts_state, 1, &acoustic_embed, false)?;
                 neg_tts_state =
                     self.advance_tts_state(&neg_tts_state, 1, &acoustic_embed, false)?;
-                step += 1;
+                budget.consume();
 
                 let eos_logit = self
                     .tts_eos_classifier
@@ -341,29 +386,12 @@ impl VibeVoiceRealtimeModel {
                     .copied()
                     .unwrap_or(0.0);
                 if eos_logit > 0.0 {
-                    finished = true;
-                    break;
+                    return Ok(speech_count);
                 }
-                if step >= max_steps || step >= max_positions {
-                    break;
-                }
-            }
-
-            if finished || text_index >= text_ids.len() && step >= max_steps {
-                break;
-            }
-            if text_index >= text_ids.len() && finished {
-                break;
-            }
-            if text_index >= text_ids.len() && step >= max_positions {
-                break;
-            }
-            if text_index >= text_ids.len() && max_steps <= step {
-                break;
             }
         }
 
-        Ok(latents)
+        Ok(speech_count)
     }
 
     fn advance_lm_state(
@@ -538,22 +566,32 @@ fn normalize_override_embedding(hidden: &Tensor) -> Result<Tensor, TtsError> {
 }
 
 fn clone_branch_state(state: &RealtimeDecoderState) -> RealtimeDecoderState {
-    RealtimeDecoderState::new(
-        state.next_position(),
-        state.last_hidden().clone(),
-        clone_layer_caches(state.layer_caches()),
-    )
+    state.clone()
 }
 
-fn clone_layer_caches(layer_caches: &[LayerKvCache]) -> Vec<LayerKvCache> {
-    layer_caches
-        .iter()
-        .map(|cache| {
-            cache
-                .as_ref()
-                .map(|(key, value)| (key.clone(), value.clone()))
-        })
-        .collect()
+struct GenerationBudget {
+    remaining: usize,
+    max_positions: usize,
+}
+
+impl GenerationBudget {
+    fn new(max_audio_tokens: usize, max_positions: usize) -> Self {
+        Self {
+            remaining: max_audio_tokens,
+            max_positions,
+        }
+    }
+
+    fn can_advance(&self, positions: &[usize]) -> bool {
+        self.remaining > 0
+            && positions
+                .iter()
+                .all(|position| *position < self.max_positions)
+    }
+
+    fn consume(&mut self) {
+        self.remaining = self.remaining.saturating_sub(1);
+    }
 }
 
 fn load_scalar(model_vb: &candle_nn::VarBuilder, name: &str) -> Result<f32, TtsError> {
@@ -565,4 +603,242 @@ fn load_scalar(model_vb: &candle_nn::VarBuilder, name: &str) -> Result<f32, TtsE
     values.first().copied().ok_or_else(|| {
         TtsError::ModelError("Expected scalar tensor in VibeVoice Realtime weights".to_string())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layers::kv_cache::KvCacheState;
+    use crate::models::vibevoice::config::{
+        VibeVoiceDecoderConfig, VibeVoiceDiffusionHeadConfig, VibeVoiceTokenizerConfig,
+    };
+    use crate::models::vibevoice_realtime::preset::VoicePresetBranch;
+
+    fn tiny_model() -> VibeVoiceRealtimeModel {
+        tiny_model_with_context(12)
+    }
+
+    fn tiny_model_with_context(max_position_embeddings: usize) -> VibeVoiceRealtimeModel {
+        let device = Device::Cpu;
+        let dtype = DType::F32;
+        let vb = candle_nn::VarBuilder::zeros(dtype, &device);
+        let decoder_config = VibeVoiceDecoderConfig {
+            vocab_size: 16,
+            hidden_size: 8,
+            intermediate_size: 12,
+            num_attention_heads: 2,
+            num_key_value_heads: 2,
+            num_hidden_layers: 2,
+            max_position_embeddings,
+            ..Default::default()
+        };
+        let acoustic_tokenizer_config = VibeVoiceTokenizerConfig {
+            vae_dim: 2,
+            encoder_n_filters: 2,
+            decoder_n_filters: 2,
+            encoder_ratios: vec![2],
+            encoder_depths: "1-1".to_string(),
+            causal: true,
+            ..Default::default()
+        };
+        let diffusion_head_config = VibeVoiceDiffusionHeadConfig {
+            hidden_size: 8,
+            head_layers: 1,
+            latent_size: 2,
+            speech_vae_dim: Some(2),
+            ddpm_num_steps: 20,
+            ddpm_num_inference_steps: 2,
+            ..Default::default()
+        };
+        let config = VibeVoiceRealtimeConfig {
+            model_type: "test".to_string(),
+            acoustic_vae_dim: 2,
+            decoder_config,
+            acoustic_tokenizer_config,
+            diffusion_head_config,
+            tts_backbone_num_hidden_layers: 1,
+        };
+        let tokenizer = TextTokenizer::from_bytes(
+            br#"{
+            "version":"1.0", "truncation":null, "padding":null, "added_tokens":[],
+            "normalizer":null, "pre_tokenizer":{"type":"Whitespace"},
+            "post_processor":null, "decoder":null,
+            "model":{"type":"WordLevel","vocab":{"[UNK]":0,"hello":1},"unk_token":"[UNK]"}
+        }"#,
+        )
+        .unwrap();
+        let spec = VibeVoiceTokenizerSpec {
+            speech_start_id: 2,
+            speech_end_id: 3,
+            speech_diffusion_id: 4,
+            eos_id: 5,
+            pad_id: 6,
+            bos_id: None,
+        };
+        let preset_branch = VoicePresetBranch {
+            state: RealtimeDecoderState::new(
+                7,
+                Tensor::zeros((1, 8), dtype, &device).unwrap(),
+                vec![Some(
+                    KvCacheState::from_tensors(
+                        Tensor::zeros((1, 2, 7, 4), dtype, &device).unwrap(),
+                        Tensor::zeros((1, 2, 7, 4), dtype, &device).unwrap(),
+                    )
+                    .unwrap(),
+                )],
+            ),
+        };
+        let preset = VoicePreset {
+            lm: preset_branch.clone(),
+            tts_lm: preset_branch.clone(),
+            _neg_lm: preset_branch.clone(),
+            neg_tts_lm: preset_branch,
+        };
+        VibeVoiceRealtimeModel {
+            language_model: Mutex::new(
+                RealtimeLanguageModel::load(&config, vb.clone(), &device, dtype, 1, false).unwrap(),
+            ),
+            tts_language_model: Mutex::new(
+                RealtimeLanguageModel::load(&config, vb.clone(), &device, dtype, 1, true).unwrap(),
+            ),
+            tts_input_types: candle_nn::embedding(2, 8, vb.clone()).unwrap(),
+            acoustic_tokenizer: VibeVoiceAcousticTokenizer::load_decoder_only(
+                &config.acoustic_tokenizer_config,
+                vb.clone(),
+            )
+            .unwrap(),
+            acoustic_connector: SpeechConnector::load(2, 8, vb.clone()).unwrap(),
+            prediction_head: VibeVoiceDiffusionHead::load(
+                &config.diffusion_head_config,
+                vb.clone(),
+            )
+            .unwrap(),
+            noise_scheduler: Mutex::new(DpmSolverMultistepScheduler::new(
+                &config.diffusion_head_config,
+            )),
+            tts_eos_classifier: BinaryClassifier::load(8, vb).unwrap(),
+            processor: VibeVoiceRealtimeProcessor::new(
+                tokenizer,
+                spec,
+                VibeVoicePreprocessorConfig::default(),
+            ),
+            speech_scaling_factor: 1.0,
+            speech_bias_factor: 0.0,
+            voice_names: vec!["test".to_string()],
+            voice_cache: Mutex::new(HashMap::from([("test".to_string(), preset)])),
+            files: ModelFiles::default(),
+            preprocessor_config: VibeVoicePreprocessorConfig::default(),
+            config,
+            device,
+            dtype,
+        }
+    }
+
+    #[test]
+    fn realtime_synthesis_streams_with_budget_smaller_than_prompt_and_matches_buffering() {
+        let model = tiny_model();
+        assert!(model.supports_streaming());
+        let request = SynthesisRequest::new("hello").with_max_tokens(5);
+        let mut chunks = Vec::new();
+        model
+            .synthesize_stream(&request, &mut |chunk| {
+                chunks.push(chunk);
+                Ok(())
+            })
+            .unwrap();
+        // One injected text position and four audio positions fit after the
+        // seven-position preset, including the final valid RoPE position.
+        assert_eq!(chunks.len(), 4);
+        assert!(chunks.iter().all(|chunk| chunk.samples.len() == 2));
+        let streamed: Vec<_> = chunks.into_iter().flat_map(|chunk| chunk.samples).collect();
+        assert_eq!(streamed, model.synthesize(&request).unwrap().samples);
+        assert_eq!(
+            streamed,
+            model
+                .synthesize(&SynthesisRequest::new("hello"))
+                .unwrap()
+                .samples
+        );
+    }
+
+    #[test]
+    fn realtime_one_audio_token_budget_does_not_count_injected_text() {
+        let model = tiny_model_with_context(64);
+        let text = std::iter::repeat_n("hello", 20)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let request = SynthesisRequest::new(text).with_max_tokens(1);
+        assert_eq!(model.processor.prepare_text(&request).unwrap().len(), 20);
+        let mut chunks = 0;
+        model
+            .synthesize_stream(&request, &mut |chunk| {
+                chunks += 1;
+                assert_eq!(chunk.samples.len(), 2);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(chunks, 1);
+    }
+
+    #[test]
+    fn realtime_text_boundary_cannot_trigger_an_extra_speech_step() {
+        let model = tiny_model();
+        let preset = model.load_voice_preset("test").unwrap();
+        let mut callbacks = 0;
+        let result = model
+            .generate_latents(
+                &preset,
+                &[1, 2, 3, 4, 5],
+                1.5,
+                5,
+                &mut SimpleRng::new(42),
+                &mut |_| {
+                    callbacks += 1;
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(result, 0);
+        assert_eq!(callbacks, 0);
+    }
+
+    #[test]
+    fn realtime_callback_error_cancels_generation_and_next_request_is_independent() {
+        let model = tiny_model();
+        let request = SynthesisRequest::new("hello").with_max_tokens(5);
+        let mut callbacks = 0;
+        let error = model
+            .synthesize_stream(&request, &mut |_| {
+                callbacks += 1;
+                Err(TtsError::RuntimeError("cancel test".to_string()))
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("cancel test"));
+        assert_eq!(callbacks, 1);
+        assert_eq!(model.synthesize(&request).unwrap().samples.len(), 8);
+    }
+
+    #[test]
+    fn realtime_budget_counts_audio_tokens_and_checks_each_branch_boundary() {
+        let mut budget = GenerationBudget::new(2, 1024);
+        assert!(budget.can_advance(&[500, 900]));
+        budget.consume();
+        assert!(budget.can_advance(&[501, 901]));
+        assert!(!budget.can_advance(&[501, 1024]));
+        budget.consume();
+        assert!(!budget.can_advance(&[502, 902]));
+        assert!(!GenerationBudget::new(0, 1024).can_advance(&[0]));
+    }
+
+    #[test]
+    fn realtime_default_capacity_is_not_charged_for_the_prompt_twice() {
+        let prompt_len = 7;
+        let max_positions = 12;
+        let mut budget = GenerationBudget::new(max_positions - prompt_len, max_positions);
+        for position in prompt_len..max_positions {
+            assert!(budget.can_advance(&[position]));
+            budget.consume();
+        }
+        assert!(!budget.can_advance(&[max_positions]));
+    }
 }

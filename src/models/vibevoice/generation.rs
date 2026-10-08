@@ -20,12 +20,12 @@ const VIBEVOICE_PROGRESS_INTERVAL_ENV: &str = "VIBEVOICE_PROGRESS_INTERVAL";
 const VIBEVOICE_SEED_ENV: &str = "VIBEVOICE_SEED";
 const VIBEVOICE_SEMANTIC_FEEDBACK_WINDOW_ENV: &str = "VIBEVOICE_SEMANTIC_FEEDBACK_WINDOW";
 
-pub type LayerKvCache = Option<(Tensor, Tensor)>;
+pub type LayerKvCache = Option<crate::layers::kv_cache::KvCacheState>;
 
 pub struct DecoderCacheState {
     next_position: usize,
     last_hidden: Tensor,
-    logits: Tensor,
+    logits: Option<Tensor>,
     layer_caches: Vec<LayerKvCache>,
 }
 
@@ -33,7 +33,7 @@ impl DecoderCacheState {
     pub fn new(
         next_position: usize,
         last_hidden: Tensor,
-        logits: Tensor,
+        logits: Option<Tensor>,
         layer_caches: Vec<LayerKvCache>,
     ) -> Self {
         Self {
@@ -52,8 +52,10 @@ impl DecoderCacheState {
         &self.last_hidden
     }
 
-    pub fn logits(&self) -> &Tensor {
-        &self.logits
+    pub fn logits(&self) -> Result<&Tensor, TtsError> {
+        self.logits.as_ref().ok_or_else(|| {
+            TtsError::ModelError("This VibeVoice state has no control logits".to_string())
+        })
     }
 
     pub fn layer_caches(&self) -> &[LayerKvCache] {
@@ -346,6 +348,12 @@ pub fn sample_token(
         .flatten_all()?
         .to_vec1::<f32>()?;
 
+    if logits.len() != valid_tokens.len() {
+        return Err(TtsError::ModelError(
+            "VibeVoice control logits and token IDs differ in length".to_string(),
+        ));
+    }
+
     if temperature <= 0.0 {
         return greedy_token(&logits, valid_tokens);
     }
@@ -408,14 +416,13 @@ pub fn semantic_feedback_window() -> usize {
 }
 
 fn greedy_token(logits: &[f32], valid_tokens: &[u32]) -> Result<u32, TtsError> {
-    valid_tokens
+    logits
         .iter()
-        .copied()
-        .max_by(|left, right| {
-            logits[*left as usize]
-                .partial_cmp(&logits[*right as usize])
-                .unwrap_or(std::cmp::Ordering::Equal)
+        .enumerate()
+        .max_by(|(_, left), (_, right)| {
+            left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
         })
+        .map(|(index, _)| valid_tokens[index])
         .ok_or_else(|| TtsError::ModelError("No valid VibeVoice tokens available".to_string()))
 }
 
@@ -425,16 +432,16 @@ fn sample_weighted_token(
     temperature: f32,
     rng: &mut SimpleRng,
 ) -> Result<u32, TtsError> {
-    let max_logit = valid_tokens
+    let max_logit = logits
         .iter()
-        .map(|token| logits[*token as usize] / temperature)
+        .map(|logit| *logit / temperature)
         .fold(f32::NEG_INFINITY, f32::max);
 
     let mut cumulative = 0.0f32;
-    let weights = valid_tokens
+    let weights = logits
         .iter()
-        .map(|token| {
-            let weight = ((logits[*token as usize] / temperature) - max_logit).exp();
+        .map(|logit| {
+            let weight = ((*logit / temperature) - max_logit).exp();
             cumulative += weight;
             weight
         })
@@ -462,6 +469,18 @@ mod tests {
     use candle_core::{DType, Device, Tensor};
 
     use super::{default_diffusion_noise_format, DiffusionNoiseFixture, TokenSequenceState};
+
+    #[test]
+    fn restricted_control_logits_map_back_to_original_token_ids() {
+        let logits = Tensor::new(&[1f32, 8.0, 2.0, 0.0], &Device::Cpu).unwrap();
+        let tokens = [151_652, 151_653, 151_654, 151_643];
+        let mut rng = super::SimpleRng::new(42);
+        assert_eq!(
+            super::sample_token(&logits, &tokens, 0.0, &mut rng).unwrap(),
+            tokens[1]
+        );
+        assert!(super::sample_token(&logits, &tokens[..2], 0.0, &mut rng).is_err());
+    }
 
     #[test]
     fn token_sequence_state_applies_overrides() {

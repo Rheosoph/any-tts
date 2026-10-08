@@ -11,6 +11,7 @@ fn test_synthesis_request_builder() {
         .with_instruct("Speak happily")
         .with_max_tokens(2048)
         .with_temperature(0.7)
+        .with_speed(1.2)
         .with_cfg_scale(3.0);
 
     assert_eq!(req.text, "Hello, world!");
@@ -19,6 +20,7 @@ fn test_synthesis_request_builder() {
     assert_eq!(req.instruct.as_deref(), Some("Speak happily"));
     assert_eq!(req.max_tokens, Some(2048));
     assert!((req.temperature.unwrap() - 0.7).abs() < f64::EPSILON);
+    assert_eq!(req.speed, Some(1.2));
     assert!((req.cfg_scale.unwrap() - 3.0).abs() < f64::EPSILON);
 }
 
@@ -31,6 +33,7 @@ fn test_synthesis_request_defaults() {
     assert!(req.instruct.is_none());
     assert!(req.max_tokens.is_none());
     assert!(req.temperature.is_none());
+    assert!(req.speed.is_none());
     assert!(req.cfg_scale.is_none());
 }
 
@@ -208,6 +211,10 @@ fn test_audio_samples_i16_conversion() {
 }
 
 #[test]
+#[cfg_attr(
+    feature = "download",
+    ignore = "Missing-path fallback can download weights; run without the download feature"
+)]
 fn test_load_model_without_path_returns_error() {
     // Without download feature disabled or HF unavailable, this should
     // fail because no files can be resolved.
@@ -232,6 +239,10 @@ fn test_load_model_without_path_returns_error() {
 }
 
 #[test]
+#[cfg_attr(
+    feature = "download",
+    ignore = "Missing-path fallback can download weights; run without the download feature"
+)]
 fn test_load_model_with_nonexistent_path_returns_error() {
     let config = TtsConfig::new(ModelType::Qwen3Tts).with_model_path("/nonexistent/path/to/model");
     let result = any_tts::load_model(config);
@@ -315,6 +326,10 @@ fn test_model_files_missing_files_kokoro() {
 }
 
 #[test]
+#[cfg_attr(
+    feature = "download",
+    ignore = "Missing-path fallback can download weights; run without the download feature"
+)]
 fn test_load_kokoro_without_path_returns_error() {
     let config = TtsConfig::new(ModelType::Kokoro);
     let result = any_tts::load_model(config);

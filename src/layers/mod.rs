@@ -7,6 +7,7 @@
 
 pub mod attention;
 pub mod conv;
+pub mod kv_cache;
 pub mod lstm;
 pub mod mlp;
 pub mod transformer;

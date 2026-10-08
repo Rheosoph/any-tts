@@ -9,6 +9,7 @@ use candle_core::{Result, Tensor};
 use candle_nn::VarBuilder;
 
 use crate::layers::attention::{GqaConfig, GroupedQueryAttention};
+use crate::layers::kv_cache::KvCacheState;
 use crate::layers::mlp::SiluMlp;
 use crate::tensor_utils::RmsNorm;
 
@@ -88,6 +89,14 @@ impl TransformerBlock {
     /// Restore the attention KV-cache for this layer.
     pub fn set_cache_state(&mut self, cache_state: Option<(Tensor, Tensor)>) {
         self.self_attn.set_cache_state(cache_state);
+    }
+
+    pub fn snapshot_cache(&self) -> Option<KvCacheState> {
+        self.self_attn.snapshot_cache()
+    }
+
+    pub fn restore_cache(&mut self, state: Option<KvCacheState>) {
+        self.self_attn.restore_cache(state);
     }
 }
 

@@ -18,6 +18,7 @@ use crate::layers::transformer::TransformerBlock;
 use crate::tensor_utils::{precompute_rope_freqs, RmsNorm};
 
 use super::config::TalkerConfig;
+use super::sampling::{apply_repetition_penalty, sample_logits};
 
 pub type TalkerPredictAndSumFn<'a> =
     dyn FnMut(&Tensor, u32, &Tensor, &Device) -> Result<(Tensor, Vec<u32>)> + 'a;
@@ -261,9 +262,24 @@ impl TalkerLm {
         trailing_text_hidden: &Tensor,
         mut generation: TalkerGenerationConfig<'_>,
     ) -> Result<(Vec<u32>, Vec<Vec<u32>>)> {
-        let _batch = text_embeds.dims()[0];
+        let (batch, prefix_len, _) = text_embeds.dims3()?;
+        if batch != 1 || prefix_len == 0 || trailing_text_hidden.dim(1)? == 0 {
+            candle_core::bail!("Qwen generation requires one nonempty prompt and trailing text")
+        }
         let device = text_embeds.device();
-        let max_tokens = generation.max_tokens;
+        let available = self
+            .rope_cos
+            .dim(0)?
+            .checked_sub(prefix_len)
+            .ok_or_else(|| {
+                candle_core::Error::Msg("Qwen prompt exceeds context capacity".into())
+            })?
+            + 1;
+        let max_tokens = generation.max_tokens.min(available);
+        if max_tokens == 0 {
+            self.clear_cache();
+            return Ok((Vec::new(), Vec::new()));
+        }
         let temperature = generation.temperature;
         let top_k = generation.top_k;
 
@@ -285,8 +301,8 @@ impl TalkerLm {
         };
 
         let mut generated = Vec::new();
+        let mut seen = vec![false; self.config.vocab_size];
         let mut all_group_tokens: Vec<Vec<u32>> = Vec::new();
-        let mut pos = seq_len;
 
         // Repetition penalty (reference uses 1.05)
         let repetition_penalty: f32 = 1.05;
@@ -295,39 +311,17 @@ impl TalkerLm {
         // --- Predict the FIRST token from the prefill output ---
         let last_hidden = h.i((.., h.dims()[1] - 1, ..))?;
 
-        let first_logits = self.logits(&last_hidden.unsqueeze(1)?)?;
-        let first_logits = first_logits.squeeze(1)?;
-        let mut first_logits = first_logits.to_dtype(DType::F32)?;
-
-        // Suppress special tokens (except EOS)
-        if suppress_start < self.config.vocab_size {
-            let logits_vec: Vec<f32> = first_logits.flatten_all()?.to_vec1()?;
-            let mut masked = logits_vec;
-            for (index, value) in masked.iter_mut().enumerate().skip(suppress_start) {
-                if index as u32 != self.config.codec_eos_token_id {
-                    *value = f32::NEG_INFINITY;
-                }
-            }
-            first_logits = Tensor::from_vec(masked, first_logits.shape(), device)?;
-        }
-
-        let first_token = {
-            let effective_temp = if temperature <= 0.0 { 1.0 } else { temperature };
-            if temperature <= 0.0 {
-                first_logits
-                    .argmax(candle_core::D::Minus1)?
-                    .to_vec1::<u32>()?[0]
-            } else {
-                let scaled = (&first_logits / effective_temp)?;
-                let scaled = if top_k > 0 {
-                    top_k_filter(&scaled, top_k)?
-                } else {
-                    scaled
-                };
-                let probs = candle_nn::ops::softmax_last_dim(&scaled)?;
-                multinomial_sample(&probs, device)?.to_vec1::<u32>()?[0]
-            }
-        };
+        let first_logits = self.logits(&last_hidden.unsqueeze(1)?)?.squeeze(1)?;
+        let first_token = sample_codec_token(
+            &first_logits,
+            &seen,
+            repetition_penalty,
+            suppress_start,
+            self.config.codec_eos_token_id,
+            false,
+            temperature,
+            top_k,
+        )?;
 
         // Check for immediate EOS
         if first_token == self.config.codec_eos_token_id {
@@ -336,6 +330,7 @@ impl TalkerLm {
         }
 
         generated.push(first_token);
+        seen[first_token as usize] = true;
 
         // Build next step input using code predictor on the first token
         let g0_token_tensor = Tensor::new(&[first_token], device)?.unsqueeze(0)?;
@@ -354,70 +349,31 @@ impl TalkerLm {
         // Reference: generation_step=0 for first generated token.
         // In non-streaming mode, trailing_text is just tts_pad_embed (len=1),
         // so we always use index 0 = tts_pad_embed.
-        let align_idx = 0usize.min(trailing_len - 1);
+        let align_idx = 0;
         let text_align = trailing_text_hidden.i((.., align_idx..align_idx + 1, ..))?;
         let mut next_step_input = summed_embed.add(&text_align)?;
 
         // --- Continue generating remaining tokens ---
         for step in 1..max_tokens {
+            let pos = seq_len + step - 1;
             // Forward one step — get pre-norm hidden for code predictor,
             // then apply norm for logits computation.
             let h_prenorm = self.forward_prenorm(&next_step_input, pos)?;
             let h = self.apply_norm(&h_prenorm)?;
             let last_hidden = h.i((.., h.dims()[1] - 1, ..))?;
 
-            // Compute logits and sample
-            let logits = self.logits(&last_hidden.unsqueeze(1)?)?;
-            let logits = logits.squeeze(1)?;
-            // Cast to F32 for numerical operations (model may run in BF16)
-            let mut logits = logits.to_dtype(DType::F32)?;
-
-            // Apply repetition penalty
-            if repetition_penalty != 1.0 {
-                let logits_vec: Vec<f32> = logits.flatten_all()?.to_vec1()?;
-                let mut penalized = logits_vec;
-                for &prev_tok in &generated {
-                    let idx = prev_tok as usize;
-                    if idx < penalized.len() {
-                        if penalized[idx] > 0.0 {
-                            penalized[idx] /= repetition_penalty;
-                        } else {
-                            penalized[idx] *= repetition_penalty;
-                        }
-                    }
-                }
-                logits = Tensor::from_vec(penalized, logits.shape(), device)?;
-            }
-
-            // Suppress special tokens (except EOS)
-            if suppress_start < self.config.vocab_size {
-                let logits_vec: Vec<f32> = logits.flatten_all()?.to_vec1()?;
-                let mut masked = logits_vec;
-                for (index, value) in masked.iter_mut().enumerate().skip(suppress_start) {
-                    if index as u32 != self.config.codec_eos_token_id {
-                        *value = f32::NEG_INFINITY;
-                    }
-                }
-                logits = Tensor::from_vec(masked, logits.shape(), device)?;
-            }
-
-            let effective_temp = if temperature <= 0.0 { 1.0 } else { temperature };
-            let next = if temperature <= 0.0 {
-                // Greedy
-                logits.argmax(candle_core::D::Minus1)?
-            } else {
-                // Temperature + top-k sampling
-                let scaled = (&logits / effective_temp)?;
-                let scaled = if top_k > 0 {
-                    top_k_filter(&scaled, top_k)?
-                } else {
-                    scaled
-                };
-                let probs = candle_nn::ops::softmax_last_dim(&scaled)?;
-                multinomial_sample(&probs, device)?
-            };
-
-            let next_token = next.to_vec1::<u32>()?[0];
+            // Read logits once; apply penalty, masking and sampling on the same buffer.
+            let logits = self.logits(&last_hidden.unsqueeze(1)?)?.squeeze(1)?;
+            let next_token = sample_codec_token(
+                &logits,
+                &seen,
+                repetition_penalty,
+                suppress_start,
+                self.config.codec_eos_token_id,
+                generated.len() >= 2,
+                temperature,
+                top_k,
+            )?;
 
             // Check for EOS
             if next_token == self.config.codec_eos_token_id {
@@ -425,7 +381,7 @@ impl TalkerLm {
             }
 
             generated.push(next_token);
-            pos += 1;
+            seen[next_token as usize] = true;
 
             // Build next step input using code predictor feedback loop.
             // Reference: codec_hiddens = [last_id_hidden] + [cp_embed[i](predicted_group_i) for i in 0..14]
@@ -465,42 +421,29 @@ impl TalkerLm {
     }
 }
 
-/// Simple multinomial sampling from a probability distribution.
-fn multinomial_sample(probs: &Tensor, _device: &Device) -> Result<Tensor> {
-    // Cumulative sum approach for sampling
-    let flat_probs: Vec<f32> = probs.flatten_all()?.to_vec1()?;
-    let r: f32 = rand_uniform();
-    let mut cumsum = 0.0;
-    let mut chosen = flat_probs.len() - 1;
-    for (i, &p) in flat_probs.iter().enumerate() {
-        cumsum += p;
-        if cumsum >= r {
-            chosen = i;
-            break;
+/// Apply all codec logits processors after a single device readback.
+#[allow(clippy::too_many_arguments)]
+fn sample_codec_token(
+    logits: &Tensor,
+    seen: &[bool],
+    penalty: f32,
+    suppress_start: usize,
+    eos: u32,
+    allow_eos: bool,
+    temperature: f64,
+    top_k: usize,
+) -> Result<u32> {
+    let mut values = logits
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    apply_repetition_penalty(&mut values, seen, penalty);
+    for (index, value) in values.iter_mut().enumerate() {
+        if (index >= suppress_start && index as u32 != eos) || (index as u32 == eos && !allow_eos) {
+            *value = f32::NEG_INFINITY;
         }
     }
-    Tensor::new(&[chosen as u32], probs.device())
-}
-
-/// Apply top-k filtering to logits: keep only the top-k values, set rest to -inf.
-fn top_k_filter(logits: &Tensor, k: usize) -> Result<Tensor> {
-    let flat: Vec<f32> = logits.flatten_all()?.to_vec1()?;
-    if k >= flat.len() {
-        return Ok(logits.clone());
-    }
-
-    // Find the k-th largest value
-    let mut sorted = flat.clone();
-    sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-    let threshold = sorted[k - 1];
-
-    // Mask values below threshold
-    let masked: Vec<f32> = flat
-        .iter()
-        .map(|&v| if v >= threshold { v } else { f32::NEG_INFINITY })
-        .collect();
-
-    Tensor::from_vec(masked, logits.shape(), logits.device())
+    sample_logits(&mut values, temperature, top_k, 1.0, rand_uniform())
 }
 
 /// Simple random float in [0, 1).
@@ -557,5 +500,25 @@ impl std::fmt::Debug for TalkerLm {
             .field("hidden_size", &self.config.hidden_size)
             .field("vocab_size", &self.config.vocab_size)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codec_sampling_masks_special_tokens_and_early_eos() -> Result<()> {
+        let logits = Tensor::new(&[1f32, 2., 100., 50.], &Device::Cpu)?;
+        let seen = [false; 4];
+        assert_eq!(
+            sample_codec_token(&logits, &seen, 1.05, 2, 3, false, 0., 50)?,
+            1
+        );
+        assert_eq!(
+            sample_codec_token(&logits, &seen, 1.05, 2, 3, true, 0., 50)?,
+            3
+        );
+        Ok(())
     }
 }

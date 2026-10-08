@@ -23,9 +23,17 @@ use super::loader::{
 };
 use super::processor::{PreparedVibeVoiceInput, VibeVoiceProcessor};
 use super::runtime::{SpeechConnector, VibeVoiceLanguageModel};
-use super::speech_tokenizer::{VibeVoiceAcousticTokenizer, VibeVoiceSemanticTokenizer};
+use super::speech_tokenizer::{
+    TokenizerStreamState, VibeVoiceAcousticTokenizer, VibeVoiceSemanticTokenizer,
+};
 
 const DEFAULT_CFG_SCALE: f32 = 3.0;
+
+#[derive(Default)]
+struct SemanticFeedbackState {
+    acoustic: TokenizerStreamState,
+    semantic: TokenizerStreamState,
+}
 
 pub struct VibeVoiceModel {
     config: VibeVoiceConfig,
@@ -58,7 +66,13 @@ impl TtsModel for VibeVoiceModel {
         let model_config = VibeVoiceConfig::from_bytes(config_bytes.as_ref())?;
         let preprocessor_config = load_preprocessor_config(&files)?;
         let processor = build_processor(&files, &preprocessor_config)?;
-        let components = load_components(&files, &model_config, &device, dtype)?;
+        let components = load_components(
+            &files,
+            &model_config,
+            &device,
+            dtype,
+            processor.tokenizer_spec(),
+        )?;
 
         info!(
             "Loaded VibeVoice on {:?}: layers={}, hidden_size={}, acoustic_dim={}, semantic_dim={}",
@@ -144,6 +158,11 @@ impl VibeVoiceModel {
     }
 
     fn validate_request(&self, request: &SynthesisRequest) -> Result<(), TtsError> {
+        if request.speed.is_some() {
+            return Err(TtsError::ModelError(
+                "VibeVoice does not support explicit speaking speed".to_string(),
+            ));
+        }
         if request.voice.is_some() {
             return Err(TtsError::ModelError(
                 "VibeVoice does not use named voice presets; provide reference audio instead."
@@ -248,6 +267,7 @@ impl VibeVoiceModel {
         let mut finished_segments = Vec::new();
         let mut generated_trace = Vec::new();
         let mut diffusion_noise_cursor = diffusion_noise_fixture.map(DiffusionNoiseFixture::cursor);
+        let mut semantic_feedback = SemanticFeedbackState::default();
 
         for _step in 0..params.max_new_tokens {
             if positive_state.next_position() >= self.config.decoder_config.max_position_embeddings
@@ -256,7 +276,7 @@ impl VibeVoiceModel {
             }
 
             let next_token = sample_token(
-                positive_state.logits(),
+                positive_state.logits()?,
                 &valid_token_ids,
                 params.temperature,
                 rng,
@@ -283,24 +303,28 @@ impl VibeVoiceModel {
                     rng,
                 )?;
                 current_segment.push(speech_latent);
-                let diffusion_embed = self.build_diffusion_override(&current_segment)?;
+                let diffusion_embed =
+                    self.build_diffusion_override(&current_segment, &mut semantic_feedback)?;
                 positive_state =
-                    self.advance_decode_state(&positive_state, diffusion_embed.clone())?;
-                negative_state = self.advance_decode_state(&negative_state, diffusion_embed)?;
+                    self.advance_decode_state(&positive_state, diffusion_embed.clone(), true)?;
+                negative_state =
+                    self.advance_decode_state(&negative_state, diffusion_embed, false)?;
                 continue;
             }
 
             let token_embedding = self.embed_token(next_token)?;
-            positive_state = self.advance_decode_state(&positive_state, token_embedding)?;
+            positive_state = self.advance_decode_state(&positive_state, token_embedding, true)?;
 
             if next_token == spec.speech_start_id {
                 finish_segment(&mut current_segment, &mut finished_segments);
+                semantic_feedback = SemanticFeedbackState::default();
                 negative_state = self.single_token_decode_state(spec.speech_start_id)?;
                 continue;
             }
 
             if next_token == spec.speech_end_id {
                 finish_segment(&mut current_segment, &mut finished_segments);
+                semantic_feedback = SemanticFeedbackState::default();
             }
         }
 
@@ -317,7 +341,7 @@ impl VibeVoiceModel {
         embedding_overrides: &HashMap<usize, Tensor>,
     ) -> Result<DecoderCacheState, TtsError> {
         let sequence = self.build_sequence_state(token_ids, embedding_overrides)?;
-        self.prefill_decode_state(&sequence.input_embeddings()?)
+        self.prefill_decode_state(&sequence.input_embeddings()?, true)
     }
 
     fn build_sequence_state(
@@ -338,27 +362,29 @@ impl VibeVoiceModel {
     fn prefill_decode_state(
         &self,
         input_embeddings: &Tensor,
+        project_logits: bool,
     ) -> Result<DecoderCacheState, TtsError> {
         let mut language_model = self.language_model.lock().map_err(|_| {
             TtsError::RuntimeError("VibeVoice language model mutex poisoned".to_string())
         })?;
-        language_model.prefill(input_embeddings)
+        language_model.prefill(input_embeddings, project_logits)
     }
 
     fn single_token_decode_state(&self, token_id: u32) -> Result<DecoderCacheState, TtsError> {
-        self.prefill_decode_state(&self.embed_token(token_id)?.unsqueeze(0)?)
+        self.prefill_decode_state(&self.embed_token(token_id)?.unsqueeze(0)?, false)
     }
 
     fn advance_decode_state(
         &self,
         state: &DecoderCacheState,
         embedding: Tensor,
+        project_logits: bool,
     ) -> Result<DecoderCacheState, TtsError> {
         let mut language_model = self.language_model.lock().map_err(|_| {
             TtsError::RuntimeError("VibeVoice language model mutex poisoned".to_string())
         })?;
         language_model.load_cache_state(state.layer_caches())?;
-        language_model.decode_step(&embedding, state.next_position())
+        language_model.decode_step(&embedding, state.next_position(), project_logits)
     }
 
     fn embed_token(&self, token_id: u32) -> Result<Tensor, TtsError> {
@@ -402,7 +428,11 @@ impl VibeVoiceModel {
         speech.narrow(0, 0, 1)?.squeeze(0).map_err(Into::into)
     }
 
-    fn build_diffusion_override(&self, segment_latents: &[Tensor]) -> Result<Tensor, TtsError> {
+    fn build_diffusion_override(
+        &self,
+        segment_latents: &[Tensor],
+        state: &mut SemanticFeedbackState,
+    ) -> Result<Tensor, TtsError> {
         let feedback_mode = self.effective_feedback_mode();
         if feedback_mode == "token" {
             return self.diffusion_token_embedding();
@@ -417,6 +447,28 @@ impl VibeVoiceModel {
         let acoustic_embed = self.acoustic_feedback_embedding(latest_latent)?;
         if feedback_mode == "acoustic" {
             return Ok(acoustic_embed);
+        }
+
+        let acoustic_config = self.acoustic_tokenizer.config();
+        let semantic_config = self.semantic_tokenizer.config();
+        let acoustic_hop = acoustic_config.decoder_ratios().iter().product::<usize>();
+        let semantic_hop = semantic_config.encoder_ratios.iter().product::<usize>();
+        if acoustic_config.causal
+            && semantic_config.causal
+            && semantic_hop != 0
+            && acoustic_hop % semantic_hop == 0
+            && semantic_feedback_window() == usize::MAX
+        {
+            let latent = latest_latent.unsqueeze(0)?.unsqueeze(1)?;
+            let audio = self.acoustic_tokenizer.decode_stream(
+                &self.unscale_generated_latents(&latent)?,
+                &mut state.acoustic,
+            )?;
+            let semantic = self
+                .semantic_tokenizer
+                .encode_stream(&audio, &mut state.semantic)?
+                .mean;
+            return self.combine_semantic_feedback(&semantic, &acoustic_embed);
         }
 
         let segment = self.semantic_feedback_segment(segment_latents)?;
@@ -537,8 +589,16 @@ impl VibeVoiceModel {
     ) -> Result<Tensor, TtsError> {
         let decoded_audio = self
             .acoustic_tokenizer
-            .decode(&self.unscale_generated_latents(segment)?)?;
+            .decode(&self.unscale_generated_latents(segment)?.transpose(1, 2)?)?;
         let semantic = self.semantic_tokenizer.encode(&decoded_audio)?.mean;
+        self.combine_semantic_feedback(&semantic, acoustic_embed)
+    }
+
+    fn combine_semantic_feedback(
+        &self,
+        semantic: &Tensor,
+        acoustic_embed: &Tensor,
+    ) -> Result<Tensor, TtsError> {
         let semantic_last = semantic.narrow(1, semantic.dim(1)? - 1, 1)?.squeeze(1)?;
         let semantic_embed = self
             .semantic_connector
@@ -556,7 +616,7 @@ impl VibeVoiceModel {
             let latents = stack_latents(segment)?;
             let audio = self
                 .acoustic_tokenizer
-                .decode(&self.unscale_generated_latents(&latents)?)?;
+                .decode(&self.unscale_generated_latents(&latents)?.transpose(1, 2)?)?;
             let mut samples = audio
                 .to_dtype(DType::F32)?
                 .flatten_all()?

@@ -1,6 +1,6 @@
 //! Tests for the OmniVoice model backend.
 
-#![cfg(feature = "omnivoice")]
+#![cfg(all(feature = "omnivoice", feature = "download"))]
 
 mod common;
 

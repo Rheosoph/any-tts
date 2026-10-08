@@ -1,6 +1,6 @@
 use std::error::Error;
 use std::fmt;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 use super::english_g2p;
 use kana2phone::kana2phone;
@@ -45,14 +45,17 @@ pub fn text_to_phonemes(
     remove_lang_switch_flags: bool,
     remove_stress: bool,
 ) -> ESpeakResult<Vec<String>> {
+    let canonical = canonical_language(language)
+        .ok_or_else(|| ESpeakError(format!("unsupported Kokoro language '{language}'")))?;
     let language = parse_language(language).ok_or_else(|| {
         ESpeakError(format!(
             "unsupported Kokoro language '{language}' for pure-Rust espeak compatibility"
         ))
     })?;
 
+    let normalized = super::text_normalization::normalize_numbers(text, canonical);
     let mut sentences = Vec::new();
-    for line in text.lines() {
+    for line in normalized.lines() {
         for (body, terminator) in split_sentences(line) {
             let mut phonemes = phonemize_body(&body, language)?;
             if remove_lang_switch_flags {
@@ -79,8 +82,30 @@ pub fn text_to_phonemes(
     Ok(sentences)
 }
 
+pub(super) fn canonical_language(language: &str) -> Option<&'static str> {
+    match language
+        .trim()
+        .to_ascii_lowercase()
+        .replace('_', "-")
+        .as_str()
+    {
+        "en" | "en-us" | "english" | "a" => Some("en-us"),
+        "en-gb" | "en-uk" | "en-gb-x-rp" | "british" | "b" => Some("en-gb"),
+        "ja" | "ja-jp" | "jp" | "japanese" | "j" => Some("ja"),
+        "zh" | "zh-cn" | "zh-hans" | "cmn" | "mandarin" | "z" => Some("cmn"),
+        "ko" | "ko-kr" | "korean" | "k" => Some("ko"),
+        "fr" | "fr-fr" | "french" | "f" => Some("fr"),
+        "de" | "de-de" | "german" | "d" => Some("de"),
+        "it" | "it-it" | "italian" | "i" => Some("it"),
+        "pt" | "pt-br" | "pt-pt" | "portuguese" | "p" => Some("pt"),
+        "es" | "es-es" | "es-mx" | "spanish" | "e" => Some("es"),
+        "hi" | "hi-in" | "hindi" | "h" => Some("hi"),
+        _ => None,
+    }
+}
+
 fn parse_language(language: &str) -> Option<SupportedLanguage> {
-    match language.to_ascii_lowercase().as_str() {
+    match canonical_language(language)? {
         "en" | "en-us" | "en_us" | "english" | "a" => Some(SupportedLanguage::EnglishUs),
         "en-gb" | "en_uk" | "en-gb-x-rp" | "british" | "b" => Some(SupportedLanguage::EnglishGb),
         "ja" | "jp" | "japanese" | "j" => Some(SupportedLanguage::Japanese),
@@ -100,7 +125,15 @@ fn split_sentences(line: &str) -> Vec<(String, char)> {
     let mut sentences = Vec::new();
     let mut current = String::new();
 
-    for ch in line.chars() {
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '.'
+            && current.chars().last().is_some_and(|c| c.is_ascii_digit())
+            && chars.peek().is_some_and(|c| c.is_ascii_digit())
+        {
+            current.push(ch);
+            continue;
+        }
         if let Some(punctuation) = normalize_punctuation(ch) {
             if matches!(punctuation, '.' | '!' | '?') {
                 if !current.trim().is_empty() {
@@ -145,31 +178,11 @@ fn phonemize_body(text: &str, language: SupportedLanguage) -> ESpeakResult<Strin
 }
 
 fn phonemize_english(text: &str, british: bool) -> ESpeakResult<String> {
-    let normalized = normalize_inline_punctuation(text);
-    let mut output = String::new();
-    let mut current = String::new();
-
-    for ch in normalized.chars() {
-        if matches!(ch, ',' | ';' | ':' | '"' | '(' | ')' | '—' | '…') {
-            if !current.trim().is_empty() {
-                output.push_str(&phonemize_english_clause(&current, british)?);
-                current.clear();
-            }
-            output.push(ch);
-        } else {
-            current.push(ch);
-        }
-    }
-
-    if !current.trim().is_empty() {
-        output.push_str(&phonemize_english_clause(&current, british)?);
-    }
-
-    Ok(output)
+    phonemize_english_clause(&normalize_inline_punctuation(text), british)
 }
 
 fn phonemize_english_clause(text: &str, british: bool) -> ESpeakResult<String> {
-    Ok(english_g2p::phonemize_clause(text, british))
+    Ok(super::g2p::engine(british).convert(text))
 }
 
 #[cfg(test)]
@@ -179,9 +192,6 @@ fn normalize_english_text(text: &str) -> String {
 
 fn phonemize_japanese_run(text: &str) -> ESpeakResult<String> {
     let tokenizer = japanese_tokenizer()?;
-    let tokenizer = tokenizer
-        .lock()
-        .map_err(|err| ESpeakError(format!("Japanese tokenizer mutex poisoned: {err}")))?;
     let mut tokens = tokenizer
         .tokenize(text)
         .map_err(|err| ESpeakError(format!("Japanese tokenization failed: {err}")))?;
@@ -246,15 +256,21 @@ fn phonemize_japanese_ascii_token(token: &str) -> String {
     english_g2p::phonemize_clause(token, false)
 }
 
-fn japanese_tokenizer() -> ESpeakResult<&'static Mutex<Tokenizer>> {
-    static TOKENIZER: OnceLock<ESpeakResult<Mutex<Tokenizer>>> = OnceLock::new();
+pub(super) fn prewarm_japanese() -> ESpeakResult<()> {
+    japanese_tokenizer().map(|_| ())
+}
+
+fn japanese_tokenizer() -> ESpeakResult<&'static Tokenizer> {
+    // Tokenizer::tokenize takes &self and allocates a request-local lattice.
+    // Sharing its immutable dictionary permits concurrent Japanese requests.
+    static TOKENIZER: OnceLock<ESpeakResult<Tokenizer>> = OnceLock::new();
 
     let state = TOKENIZER.get_or_init(|| {
         let dictionary = load_dictionary("embedded://ipadic").map_err(|err| {
             ESpeakError(format!("failed to load embedded Lindera dictionary: {err}"))
         })?;
         let segmenter = Segmenter::new(Mode::Normal, dictionary, None);
-        Ok(Mutex::new(Tokenizer::new(segmenter)))
+        Ok(Tokenizer::new(segmenter))
     });
 
     match state {
@@ -2581,7 +2597,7 @@ mod tests {
             "unexpected Rust output: {phonemes}"
         );
         assert!(
-            phonemes.contains("kəkˈɔːɹoʊ"),
+            phonemes.contains("kəkˈɔɹO"),
             "unexpected Kokoro output: {phonemes}"
         );
     }
