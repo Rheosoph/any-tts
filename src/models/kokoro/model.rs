@@ -540,12 +540,13 @@ impl KokoroModel {
         }
 
         // Fall back to bare-tensor parsing for non-dict .pt files
-        let mut zip = zip::ZipArchive::new(Cursor::new(bytes.as_ref()))
+        let mut zip = crate::models::archive::open(Cursor::new(bytes.as_ref()))
             .map_err(|e| TtsError::WeightLoadError(format!("Invalid .pt ZIP: {}", e)))?;
 
         // Find the .pkl file and the data directory prefix
         let pkl_name = {
-            let names: Vec<String> = zip.file_names().map(|s| s.to_string()).collect();
+            let names = crate::models::archive::names(&zip)
+                .map_err(|e| TtsError::WeightLoadError(format!("Invalid .pt ZIP names: {e}")))?;
             names
                 .into_iter()
                 .find(|n| n.ends_with("data.pkl"))
@@ -578,7 +579,7 @@ impl KokoroModel {
 
         // Read the raw tensor data from the ZIP
         // Re-open the ZIP since we consumed the reader
-        let mut zip2 = zip::ZipArchive::new(Cursor::new(bytes.as_ref()))
+        let mut zip2 = crate::models::archive::open(Cursor::new(bytes.as_ref()))
             .map_err(|e| TtsError::WeightLoadError(format!("Invalid .pt ZIP: {}", e)))?;
 
         let data_path = &tensor_info.path;
@@ -897,13 +898,11 @@ impl KokoroModel {
     ) -> Result<Vec<candle_core::pickle::TensorInfo>, TtsError> {
         use candle_core::pickle::{Object, Stack};
 
-        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).map_err(|e| {
+        let mut zip = crate::models::archive::open(std::io::Cursor::new(bytes)).map_err(|e| {
             TtsError::WeightLoadError(format!("Failed to open .pth archive: {}", e))
         })?;
-        let zip_file_names = zip
-            .file_names()
-            .map(|name| name.to_string())
-            .collect::<Vec<_>>();
+        let zip_file_names = crate::models::archive::names(&zip)
+            .map_err(|e| TtsError::WeightLoadError(format!("Invalid .pth ZIP names: {e}")))?;
 
         let mut tensor_infos = Vec::new();
         for file_name in zip_file_names
@@ -977,7 +976,7 @@ impl KokoroModel {
     ) -> Result<Tensor, TtsError> {
         use std::io::Read;
 
-        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).map_err(|e| {
+        let mut zip = crate::models::archive::open(std::io::Cursor::new(bytes)).map_err(|e| {
             TtsError::WeightLoadError(format!("Failed to open .pth archive: {}", e))
         })?;
         let mut reader = zip.by_name(&tensor_info.path).map_err(|e| {

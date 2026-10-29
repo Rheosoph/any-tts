@@ -1554,7 +1554,7 @@ fn load_voice_tensor(
 ) -> Result<Tensor, TtsError> {
     let bytes = asset.read_bytes()?;
     let mut archive =
-        zip::ZipArchive::new(std::io::Cursor::new(bytes.as_ref())).map_err(|err| {
+        crate::models::archive::open(std::io::Cursor::new(bytes.as_ref())).map_err(|err| {
             TtsError::WeightLoadError(format!(
                 "Failed to open Voxtral voice embedding '{}': {}",
                 asset.display_name(),
@@ -1562,10 +1562,10 @@ fn load_voice_tensor(
             ))
         })?;
 
-    let data_pkl = archive
-        .file_names()
+    let data_pkl = crate::models::archive::names(&archive)
+        .map_err(|e| TtsError::WeightLoadError(format!("Invalid voice ZIP names: {e}")))?
+        .into_iter()
         .find(|name| name.ends_with("data.pkl"))
-        .map(str::to_string)
         .ok_or_else(|| {
             TtsError::WeightLoadError(format!(
                 "Voice embedding file '{}' is missing data.pkl",

@@ -2,7 +2,7 @@
 name = "any-tts"
 version = "0.2.0"
 edition = "2021"
-rust-version = "1.83"
+rust-version = "1.88"
 description = "A Rust TTS library with Candle backends and runtime adapters for modern open TTS models"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
@@ -86,9 +86,9 @@ download = ["dep:reqwest"]
 fancy-regex = { version = "0.17", optional = true }
 unicode-normalization = { version = "0.1", optional = true }
 base64 = "0.22"
-candle-core = "0.10.2"
-candle-nn = "0.10.2"
-candle-transformers = "0.10.2"
+candle-core = { git = "https://github.com/Rheosoph/candle.git", rev = "6fefd7694d55609b914eb766b8c5c1bdb961b5f7" }
+candle-nn = { git = "https://github.com/Rheosoph/candle.git", rev = "6fefd7694d55609b914eb766b8c5c1bdb961b5f7" }
+candle-transformers = { git = "https://github.com/Rheosoph/candle.git", rev = "6fefd7694d55609b914eb766b8c5c1bdb961b5f7" }
 rustc-hash = "1.1"
 rustfft = "6"
 safetensors = "0.7.0"
@@ -99,7 +99,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tracing = "0.1"
-zip = { version = "7.2", default-features = false }
+zip = { version = "9.0.5", default-features = false }
 kana2phone = { version = "0.3", optional = true }
 lindera = { version = "2.3.4", default-features = false, features = ["embed-ipadic"], optional = true }
 pinyin = { version = "0.11", default-features = false, features = ["plain", "with_tone_num_end"], optional = true }

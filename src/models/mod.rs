@@ -1,5 +1,7 @@
 //! Model backends for TTS synthesis.
 
+mod archive;
+
 #[cfg(feature = "kokoro")]
 pub mod kokoro;
 

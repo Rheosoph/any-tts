@@ -28,14 +28,16 @@ pub struct VoicePreset {
 impl VoicePreset {
     pub fn load(asset: &ModelAsset, device: &Device, dtype: DType) -> Result<Self, TtsError> {
         let bytes = asset.read_bytes()?;
-        let mut archive = ZipArchive::new(Cursor::new(bytes.to_vec())).map_err(|error| {
-            TtsError::ModelError(format!(
-                "Failed to open VibeVoice Realtime voice preset archive {}: {error}",
-                asset.display_name(),
-            ))
-        })?;
-        let root_prefix = archive
-            .file_names()
+        let mut archive =
+            crate::models::archive::open(Cursor::new(bytes.to_vec())).map_err(|error| {
+                TtsError::ModelError(format!(
+                    "Failed to open VibeVoice Realtime voice preset archive {}: {error}",
+                    asset.display_name(),
+                ))
+            })?;
+        let root_prefix = crate::models::archive::names(&archive)
+            .map_err(|e| TtsError::ModelError(format!("Invalid voice preset ZIP names: {e}")))?
+            .into_iter()
             .find_map(|name| name.strip_suffix("data.pkl").map(str::to_string))
             .ok_or_else(|| {
                 TtsError::ModelError(format!(
